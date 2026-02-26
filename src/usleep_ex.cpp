@@ -1,0 +1,392 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <mmsystem.h>
+#include <profileapi.h>
+#include <processthreadsapi.h>
+#include <atomic>
+#include <stdint.h>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "winmm.lib")
+#endif
+
+#if defined(_MSC_VER)
+  #include <intrin.h>
+#endif
+
+#include "../include/usleep_win.h"
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#ifndef CREATE_WAITABLE_TIMER_MANUAL_RESET
+#define CREATE_WAITABLE_TIMER_MANUAL_RESET 0x00000001
+#endif
+
+#ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
+#define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
+typedef struct _THREAD_POWER_THROTTLING_STATE
+{
+	ULONG Version;
+	ULONG ControlMask;
+	ULONG StateMask;
+} THREAD_POWER_THROTTLING_STATE, *PTHREAD_POWER_THROTTLING_STATE;
+#endif
+#ifndef THREAD_POWER_THROTTLING_EXECUTION_SPEED
+#define THREAD_POWER_THROTTLING_EXECUTION_SPEED 0x1
+#endif
+#ifndef ThreadPowerThrottling
+#define ThreadPowerThrottling (THREAD_INFORMATION_CLASS)11
+#endif
+
+#ifndef YieldProcessor
+  #if defined(_M_AMD64) || defined(_M_IX86)
+	#include <immintrin.h>
+	#define YieldProcessor() _mm_pause()
+  #elif defined(_M_ARM64)
+	#define YieldProcessor() __yield()
+  #else
+	#define YieldProcessor() ((void)0)
+  #endif
+#endif
+
+static std::atomic<unsigned> g_time_period_ms{0};
+static std::atomic<bool>	 g_has_hrtimer{false};
+
+static thread_local uint64_t t_stat_spin_relax	 = 0;
+static thread_local uint64_t t_stat_yield_switch= 0;
+static thread_local uint64_t t_stat_yield_sleep0= 0;
+static thread_local uint64_t t_stat_yield_sleep1= 0;
+static thread_local uint64_t t_stat_timer_uses	= 0;
+
+static inline void cpu_relax()
+{
+	YieldProcessor();
+	t_stat_spin_relax++;
+}
+
+static thread_local HANDLE t_timer = NULL;
+
+struct UsleepConfig
+{
+	UsleepProfile	  profile	   = USLP_BALANCED;
+	unsigned		  spin_last_us = 250;
+	UsleepPowerMode   power_mode   = USLP_POWER_DEFAULT;
+	UsleepYieldPolicy yield_policy = USLP_YIELD_SLEEP0;
+};
+static thread_local UsleepConfig t_cfg;
+
+static inline LARGE_INTEGER qpc_freq()
+{
+	static LARGE_INTEGER f = []{ LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
+	return f;
+}
+static inline uint64_t qpc_now_us()
+{
+	LARGE_INTEGER now; QueryPerformanceCounter(&now);
+	const auto f = (uint64_t)qpc_freq().QuadPart;
+	return (uint64_t)((now.QuadPart * 1000000ULL) / f);
+}
+static inline LONGLONG us_to_100ns(uint64_t us) {
+	const uint64_t k = 10ULL;
+	if (us > (uint64_t)(INT64_MAX / k)) us = (uint64_t)(INT64_MAX / k);
+	return -(LONGLONG)(us * k);
+}
+
+static HANDLE get_timer_handle()
+{
+	if (t_timer) return t_timer;
+	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+	if (k32)
+	{
+		using PFN_CreateWaitableTimerExW = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+		auto p = reinterpret_cast<PFN_CreateWaitableTimerExW>(GetProcAddress(k32, "CreateWaitableTimerExW"));
+		if (p)
+		{
+			HANDLE h = p(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+			if (h)
+			{
+				g_has_hrtimer.store(true);
+				return (t_timer = h);
+			}
+		}
+	}
+	HANDLE h = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+	if (h)
+	{
+		g_has_hrtimer.store(false);
+		t_timer = h;
+	}
+	return t_timer;
+}
+
+static void spin_with_yield_until_us(
+	uint64_t target_us,
+	unsigned spin_last_us,
+	UsleepYieldPolicy policy_for_coarse
+)
+{
+	unsigned ctr = 0;
+	for (;;)
+	{
+		uint64_t now = qpc_now_us();
+		if (now >= target_us) break;
+		uint64_t remain = target_us - now;
+		if (remain > spin_last_us)
+		{
+			if ((++ctr & 63u) == 0u)
+			{
+				switch (policy_for_coarse)
+				{
+				case USLP_YIELD_SWITCH_THREAD: t_stat_yield_switch++; SwitchToThread(); break;
+				case USLP_YIELD_SLEEP0: 	   t_stat_yield_sleep0++; Sleep(0); 		break;
+				case USLP_YIELD_SLEEP1: 	   t_stat_yield_sleep1++; Sleep(1); 		break;
+				case USLP_YIELD_NONE:
+				default: cpu_relax(); break;
+				}
+			}
+			else
+			{
+				cpu_relax();
+				cpu_relax();
+				cpu_relax();
+			}
+		}
+		else
+		{
+			cpu_relax();
+		}
+	}
+}
+
+static void do_sleep_us(uint64_t usec)
+{
+	if (usec == 0)
+	{
+		t_stat_yield_switch++; SwitchToThread();
+		return;
+	}
+
+	const UsleepProfile prof = t_cfg.profile;
+	const unsigned spin_last_us = t_cfg.spin_last_us;
+	const UsleepYieldPolicy yield_policy = t_cfg.yield_policy;
+
+	uint64_t timer_first_us;
+	uint64_t prefer_spin_below;
+
+	switch (prof)
+	{
+	case USLP_STRICT:	 timer_first_us = 1500; prefer_spin_below = 500; break;
+	case USLP_LOW_POWER: timer_first_us = 1000; prefer_spin_below = 0;	 break;
+	default:			 timer_first_us = 2000; prefer_spin_below = 200; break;
+	}
+
+	const uint64_t target_us = qpc_now_us() + usec;
+	bool can_hr = g_has_hrtimer.load();
+
+	if (usec >= timer_first_us || (can_hr && usec > prefer_spin_below))
+	{
+		HANDLE h = get_timer_handle();
+		if (h)
+		{
+			uint64_t coarse_us = usec;
+			if (spin_last_us > 0 && usec > spin_last_us) coarse_us = usec - spin_last_us;
+			LARGE_INTEGER due; due.QuadPart = us_to_100ns(coarse_us);
+			if (SetWaitableTimer(h, &due, 0, nullptr, nullptr, FALSE))
+			{
+				t_stat_timer_uses++;
+				WaitForSingleObject(h, INFINITE);
+				if (spin_last_us > 0)
+				{
+					spin_with_yield_until_us(target_us, 0, USLP_YIELD_NONE);
+				}
+				else if (prof != USLP_LOW_POWER)
+				{
+					while (qpc_now_us() < target_us) cpu_relax();
+				}
+				return;
+			}
+		}
+		if (usec >= 1000)
+		{
+			DWORD ms = (DWORD)(usec / 1000);
+			if (ms == 0) ms = 1;
+			t_stat_yield_sleep1++;
+			Sleep(ms);
+			if (spin_last_us > 0)
+			{
+				spin_with_yield_until_us(target_us, 0, USLP_YIELD_NONE);
+			}
+			return;
+		}
+	}
+
+	if (prof == USLP_LOW_POWER)
+	{
+		spin_with_yield_until_us(target_us, 0, USLP_YIELD_SLEEP1);
+	}
+	else
+	{
+		spin_with_yield_until_us(target_us, spin_last_us, yield_policy);
+	}
+}
+
+extern "C" {
+
+USLEEP_API void usleep_win(uint64_t usec)
+{
+	do_sleep_us(usec);
+}
+
+USLEEP_API void nsleep_win(uint64_t nsec)
+{
+	do_sleep_us(nsec / 1000ULL);
+}
+
+USLEEP_API uint64_t usleep_now_steady_us()
+{
+	return qpc_now_us();
+}
+
+USLEEP_API void usleep_until_steady_us(uint64_t target_us)
+{
+	uint64_t now = qpc_now_us();
+	if (target_us <= now) return;
+	do_sleep_us(target_us - now);
+}
+
+USLEEP_API int usleep_init_timer_resolution(unsigned int ms)
+{
+	if (ms == 0)
+	{
+		unsigned prev = g_time_period_ms.exchange(0);
+		if (prev) timeEndPeriod(prev);
+		return 0;
+	}
+	MMRESULT r = timeBeginPeriod(ms);
+	if (r == TIMERR_NOERROR)
+	{
+		unsigned prev = g_time_period_ms.exchange(ms);
+		if (prev && prev != ms) timeEndPeriod(prev);
+		return 0;
+	}
+	return -1;
+}
+
+USLEEP_API void usleep_shutdown_timer_resolution()
+{
+	unsigned prev = g_time_period_ms.exchange(0);
+	if (prev) timeEndPeriod(prev);
+}
+
+USLEEP_API int usleep_set_profile(int profile)
+{
+	if (profile < USLP_BALANCED || profile > USLP_LOW_POWER) return -1;
+	t_cfg.profile = (UsleepProfile)profile;
+	if (t_cfg.profile == USLP_LOW_POWER)
+	{
+		t_cfg.spin_last_us = 0;
+		t_cfg.yield_policy = USLP_YIELD_SLEEP1;
+	}
+	else if (t_cfg.profile == USLP_STRICT)
+	{
+		if (t_cfg.spin_last_us < 300) t_cfg.spin_last_us = 400;
+		t_cfg.yield_policy = USLP_YIELD_SWITCH_THREAD;
+	}
+	else
+	{
+		t_cfg.spin_last_us = 250;
+		t_cfg.yield_policy = USLP_YIELD_SLEEP0;
+	}
+	return 0;
+}
+
+USLEEP_API int usleep_set_spin_last_us(unsigned int us)
+{
+	t_cfg.spin_last_us = us;
+	return 0;
+}
+
+USLEEP_API int usleep_set_yield_policy(int policy)
+{
+	if (policy < USLP_YIELD_NONE || policy > USLP_YIELD_SLEEP1) return -1;
+	t_cfg.yield_policy = (UsleepYieldPolicy)policy;
+	return 0;
+}
+
+USLEEP_API int usleep_set_power_mode(int mode)
+{
+	if (mode < USLP_POWER_DEFAULT || mode > USLP_POWER_ECO) return -1;
+
+	using PFN_SetThreadInformation = BOOL (WINAPI*)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+	auto pSetThreadInformation = (PFN_SetThreadInformation)GetProcAddress(k32, "SetThreadInformation");
+	if (!pSetThreadInformation)
+	{
+		t_cfg.power_mode = (UsleepPowerMode)mode;
+		return 0;
+	}
+
+	THREAD_POWER_THROTTLING_STATE state{};
+	state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+
+	if (mode == USLP_POWER_ECO)
+	{
+		state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+		state.StateMask   = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	}
+	else if (mode == USLP_POWER_PERF)
+	{
+		state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+		state.StateMask   = 0;
+	}
+	else
+	{
+		state.ControlMask = 0;
+		state.StateMask   = 0;
+	}
+
+	BOOL ok = pSetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state));
+	if (ok) t_cfg.power_mode = (UsleepPowerMode)mode;
+	return ok ? 0 : -1;
+}
+
+USLEEP_API void usleep_get_stats(usleep_stats_t* out)
+{
+	if (!out) return;
+	out->spin_relax 		 = t_stat_spin_relax;
+	out->yield_switch		 = t_stat_yield_switch;
+	out->yield_sleep0		 = t_stat_yield_sleep0;
+	out->yield_sleep1		 = t_stat_yield_sleep1;
+	out->waitable_timer_uses = t_stat_timer_uses;
+}
+
+USLEEP_API void usleep_reset_stats(void)
+{
+	t_stat_spin_relax	= 0;
+	t_stat_yield_switch = 0;
+	t_stat_yield_sleep0 = 0;
+	t_stat_yield_sleep1 = 0;
+	t_stat_timer_uses	= 0;
+}
+
+} // extern "C"
+
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
+{
+	if (reason == DLL_THREAD_DETACH || reason == DLL_PROCESS_DETACH)
+	{
+		if (t_timer)
+		{
+			CloseHandle(t_timer);
+			t_timer = NULL;
+		}
+
+		if (reason == DLL_PROCESS_DETACH)
+		{
+			unsigned prev = g_time_period_ms.exchange(0);
+			if (prev) timeEndPeriod(prev);
+		}
+	}
+	return TRUE;
+}
