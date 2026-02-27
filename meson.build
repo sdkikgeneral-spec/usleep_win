@@ -40,7 +40,8 @@ inc = include_directories('include')
 
 uslp_sources = ['src/usleep_ex.cpp']
 if host_machine.system() == 'windows'
-  uslp_sources += ['resource/usleep_win.rc']
+  windows_mod = import('windows')
+  uslp_sources += windows_mod.compile_resources('resource/usleep_win.rc')
 endif
 
 uslp = shared_library(
