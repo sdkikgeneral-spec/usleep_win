@@ -38,9 +38,14 @@ cc = meson.get_compiler('cpp')
 winmm = cc.find_library('winmm', required: true)
 inc = include_directories('include')
 
+uslp_sources = ['src/usleep_ex.cpp']
+if host_machine.system() == 'windows'
+  uslp_sources += ['resource/usleep_win.rc']
+endif
+
 uslp = shared_library(
   'usleep_win',
-  sources: ['src/usleep_ex.cpp'],
+  sources: uslp_sources,
   include_directories: inc,
   cpp_args: cflags + ['-DUSLEEPWIN_EXPORTS'],
   dependencies: [winmm],
