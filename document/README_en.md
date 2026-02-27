@@ -191,6 +191,8 @@ include/
  └ usleep_win.h
 src/
  └ usleep_ex.cpp
+resource/
+ └ usleep_win.rc
 tools/
  └ bench_usleep_csv.cpp
 tests/
@@ -200,7 +202,7 @@ tests/
 ---
 
 ## 📜 License
-MIT License (feel free to change as needed)
+This repository is licensed under the MIT License. See [LICENSE](../LICENSE) for details.
 
 ---
 

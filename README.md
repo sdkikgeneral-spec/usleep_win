@@ -191,6 +191,8 @@ include/
  └ usleep_win.h
 src/
  └ usleep_ex.cpp
+resource/
+ └ usleep_win.rc
 tools/
  └ bench_usleep_csv.cpp
 tests/
@@ -200,7 +202,7 @@ tests/
 ---
 
 ## 📜 ライセンス
-MIT License（用途に合わせて変更可）
+このリポジトリは MIT License で提供しています。詳細は [LICENSE](./LICENSE) を参照してください。
 
 ---
 
