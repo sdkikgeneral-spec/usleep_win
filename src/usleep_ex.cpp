@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
@@ -12,6 +14,10 @@
 
 #if defined(_MSC_VER)
   #include <intrin.h>
+#endif
+
+#ifndef USLEEPWIN_EXPORTS
+#define USLEEPWIN_EXPORTS
 #endif
 
 #include "../include/usleep_win.h"
@@ -85,7 +91,15 @@ static inline uint64_t qpc_now_us()
 {
 	LARGE_INTEGER now; QueryPerformanceCounter(&now);
 	const auto f = (uint64_t)qpc_freq().QuadPart;
-	return (uint64_t)((now.QuadPart * 1000000ULL) / f);
+	if (f == 0) return 0;
+	const uint64_t ticks = (uint64_t)now.QuadPart;
+	const uint64_t q = ticks / f;
+	const uint64_t r = ticks % f;
+	if (q > (UINT64_MAX / 1000000ULL)) return UINT64_MAX;
+	const uint64_t base_us = q * 1000000ULL;
+	const uint64_t rem_us = (uint64_t)(((long double)r * 1000000.0L) / (long double)f);
+	if (base_us > (UINT64_MAX - rem_us)) return UINT64_MAX;
+	return base_us + rem_us;
 }
 static inline LONGLONG us_to_100ns(uint64_t us) {
 	const uint64_t k = 10ULL;
@@ -181,7 +195,8 @@ static void do_sleep_us(uint64_t usec)
 	default:			 timer_first_us = 2000; prefer_spin_below = 200; break;
 	}
 
-	const uint64_t target_us = qpc_now_us() + usec;
+	const uint64_t now_us = qpc_now_us();
+	const uint64_t target_us = (usec > (UINT64_MAX - now_us)) ? UINT64_MAX : (now_us + usec);
 	bool can_hr = g_has_hrtimer.load();
 
 	if (usec >= timer_first_us || (can_hr && usec > prefer_spin_below))
@@ -209,8 +224,10 @@ static void do_sleep_us(uint64_t usec)
 		}
 		if (usec >= 1000)
 		{
-			DWORD ms = (DWORD)(usec / 1000);
-			if (ms == 0) ms = 1;
+			uint64_t ms64 = usec / 1000ULL;
+			if (ms64 == 0) ms64 = 1;
+			if (ms64 > (uint64_t)MAXDWORD) ms64 = (uint64_t)MAXDWORD;
+			DWORD ms = (DWORD)ms64;
 			t_stat_yield_sleep1++;
 			Sleep(ms);
 			if (spin_last_us > 0)
@@ -320,6 +337,11 @@ USLEEP_API int usleep_set_power_mode(int mode)
 
 	using PFN_SetThreadInformation = BOOL (WINAPI*)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
 	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+	if (!k32)
+	{
+		t_cfg.power_mode = (UsleepPowerMode)mode;
+		return 0;
+	}
 	auto pSetThreadInformation = (PFN_SetThreadInformation)GetProcAddress(k32, "SetThreadInformation");
 	if (!pSetThreadInformation)
 	{
