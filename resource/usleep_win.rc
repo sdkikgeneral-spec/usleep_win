@@ -1,8 +1,8 @@
 #include <winresrc.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,2,1,0
+ PRODUCTVERSION 0,2,1,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -19,11 +19,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "usleep_win contributors\0"
             VALUE "FileDescription", "usleep_win Windows DLL\0"
-            VALUE "FileVersion", "0.2.0.0\0"
+            VALUE "FileVersion", "0.2.1.0\0"
             VALUE "InternalName", "usleep_win.dll\0"
             VALUE "OriginalFilename", "usleep_win.dll\0"
             VALUE "ProductName", "usleep_win\0"
-            VALUE "ProductVersion", "0.2.0.0\0"
+            VALUE "ProductVersion", "0.2.1.0\0"
         END
     END
     BLOCK "VarFileInfo"
