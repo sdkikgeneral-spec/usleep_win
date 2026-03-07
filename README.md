@@ -3,6 +3,8 @@
 
 `usleep_win` は、Windows 上で **Linux の `usleep()` に相当する “実用的な精度と低負荷” の待機** を実現するための、小型・依存関係ゼロの C/C++ 向け DLL / ライブラリです。
 
+English README: [document/README_en.md](./document/README_en.md)
+
 - High-Resolution Waitable Timer（100ns）
 - QueryPerformanceCounter (QPC)
 - `YieldProcessor()`（x86: `PAUSE` / ARM64: `YIELD`）
