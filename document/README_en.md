@@ -33,6 +33,11 @@ High-accuracy, low-jitter `usleep()` for Windows (WaitableTimer + QPC + YieldPro
 | **STRICT** | Lower jitter; thicker spin and `SwitchToThread()` preference |
 | **LOW_POWER** | Power-saving; mostly `Sleep(1)` (higher jitter) |
 
+### ⚡ NT native API for sub-millisecond timer resolution (optional)
+- Uses `NtSetTimerResolution` (ntdll.dll) to set system timer granularity as fine as **0.5 ms**
+- More precise than `timeBeginPeriod(1)` which bottoms out at 1 ms
+- `usleep_query_nt_resolution()` lets you check the minimum resolution supported on the current system before committing
+
 ### 📊 Stats API (per-thread)
 - `spin_relax` (PAUSE/YIELD count)
 - `yield_switch` / `yield_sleep0` / `yield_sleep1`
@@ -146,6 +151,42 @@ usleep_init_timer_resolution(1);   // system-wide effect
 usleep_shutdown_timer_resolution();
 ```
 
+### 7) **Optional: sub-millisecond timer resolution via NT native API**
+
+`timeBeginPeriod(1)` is limited to 1 ms granularity. `usleep_init_nt_resolution` uses
+`NtSetTimerResolution` (ntdll.dll) to reach **0.5 ms (5000 × 100 ns)** on most systems,
+improving the accuracy of waitable-timer-based waits.
+
+```cpp
+// 1. Query what the system supports
+unsigned min_res = 0, max_res = 0, cur_res = 0;
+if (usleep_query_nt_resolution(&min_res, &max_res, &cur_res) == 0) {
+    // min_res: coarsest value  (e.g. 156250 = 15.625 ms)
+    // max_res: finest value    (e.g.   5000 =  0.5  ms)  ← use this
+    // cur_res: current setting
+}
+
+// 2. Apply finest resolution (use max_res, or hard-code 5000)
+usleep_init_nt_resolution(max_res);   // system-specific maximum precision
+// or
+usleep_init_nt_resolution(5000);      // fixed 0.5 ms (effective only if supported)
+
+// 3. Use as normal — the underlying timer granularity is now finer
+usleep_win(800);   // 800 µs sleep
+
+// 4. Always restore when done (reverts system-wide change)
+usleep_shutdown_nt_resolution();
+```
+
+> **Note**: Like `timeBeginPeriod`, this affects the entire system. Always call
+> `usleep_shutdown_nt_resolution()` on exit or when precision is no longer needed.
+> `NtSetTimerResolution` is undocumented but has been stable since Windows 2000.
+
+| API | Granularity |
+| --- | --- |
+| `timeBeginPeriod(1)` | min **1.0 ms** |
+| `usleep_init_nt_resolution(5000)` | min **0.5 ms** (where supported) |
+
 ---
 
 ## 🔧 Profile Tuning Guide
@@ -182,6 +223,28 @@ Columns:
 ```
 iter,late_us,cpu_pct,spin_relax,yield_switch,yield_sleep0,yield_sleep1,timer_used
 ```
+
+### Measured Comparison (2026-03-07)
+
+The following results were measured on the same machine, running `2000 iter / 1000us tick` three times per configuration and averaging each metric.
+
+- OS: Windows 10.0.26200.7922
+- CPU: AMD Ryzen 7 5800H with Radeon Graphics
+- Profile: fixed to `USLP_BALANCED`
+- Data source: `bench_outputs/summary_runs.csv` / `bench_outputs/summary_agg.csv`
+
+| config | setting | avg_late_us | p95_late_us | p99_late_us | max_late_us | avg_cpu_pct |
+|---|---|---:|---:|---:|---:|---:|
+| balanced_none_spin200 | `yield=NONE, spin=200` | 0.14 | 1.00 | 1.00 | 57.67 | 99.96 |
+| balanced_sleep0_spin200 | `yield=SLEEP0, spin=200` | 0.25 | 0.67 | 1.00 | 115.33 | 99.46 |
+| balanced_sleep0_spin300 | `yield=SLEEP0, spin=300` | 0.29 | 1.00 | 1.00 | 132.33 | 99.43 |
+| balanced_switch_spin200 | `yield=SWITCH_THREAD, spin=200` | 0.31 | 0.33 | 1.00 | 203.33 | 98.90 |
+| balanced_sleep1_spin200 | `yield=SLEEP1, spin=200` | 7505.87 | 14403.00 | 15150.00 | 15876.33 | 0.02 |
+
+Notes:
+- `SLEEP1` drastically reduces CPU usage, but latency becomes much larger for 1 ms periodic workloads.
+- `NONE/SLEEP0/SWITCH_THREAD` keep latency low, but CPU usage remains high.
+- In this benchmark, `timer_used=0`, which indicates convergence mainly by spin/yield behavior rather than waitable timer usage.
 
 ---
 

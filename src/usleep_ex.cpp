@@ -29,6 +29,27 @@
 #define CREATE_WAITABLE_TIMER_MANUAL_RESET 0x00000001
 #endif
 
+// NT ネイティブ API (ntdll.dll) — undocumented だが Win2000 以降で安定して存在する
+#ifndef NT_SUCCESS
+typedef LONG NTSTATUS;
+#define NT_SUCCESS(s) ((NTSTATUS)(s) >= 0)
+#endif
+typedef NTSTATUS (NTAPI* PFN_NtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+typedef NTSTATUS (NTAPI* PFN_NtQueryTimerResolution)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
+
+static PFN_NtSetTimerResolution get_NtSetTimerResolution()
+{
+	static auto fn = (PFN_NtSetTimerResolution)GetProcAddress(
+		GetModuleHandleW(L"ntdll.dll"), "NtSetTimerResolution");
+	return fn;
+}
+static PFN_NtQueryTimerResolution get_NtQueryTimerResolution()
+{
+	static auto fn = (PFN_NtQueryTimerResolution)GetProcAddress(
+		GetModuleHandleW(L"ntdll.dll"), "NtQueryTimerResolution");
+	return fn;
+}
+
 #ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
 #define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
 typedef struct _THREAD_POWER_THROTTLING_STATE
@@ -58,6 +79,7 @@ typedef struct _THREAD_POWER_THROTTLING_STATE
 
 static std::atomic<unsigned> g_time_period_ms{0};
 static std::atomic<bool>	 g_has_hrtimer{false};
+static std::atomic<unsigned> g_nt_resolution_100ns{0};
 
 static thread_local uint64_t t_stat_spin_relax	 = 0;
 static thread_local uint64_t t_stat_yield_switch= 0;
@@ -373,6 +395,61 @@ USLEEP_API int usleep_set_power_mode(int mode)
 	return ok ? 0 : -1;
 }
 
+USLEEP_API int usleep_query_nt_resolution(unsigned int* min_100ns, unsigned int* max_100ns, unsigned int* cur_100ns)
+{
+	auto fn = get_NtQueryTimerResolution();
+	if (!fn) return -1;
+	ULONG mn = 0, mx = 0, cur = 0;
+	NTSTATUS st = fn(&mn, &mx, &cur);
+	if (!NT_SUCCESS(st)) return -1;
+	if (min_100ns) *min_100ns = (unsigned)mn;
+	if (max_100ns) *max_100ns = (unsigned)mx;
+	if (cur_100ns) *cur_100ns = (unsigned)cur;
+	return 0;
+}
+
+USLEEP_API int usleep_init_nt_resolution(unsigned int hundreds_ns)
+{
+	auto fn = get_NtSetTimerResolution();
+	if (!fn) return -1;
+
+	if (hundreds_ns == 0)
+	{
+		// 0 は「解除」— 以前セットした値でリリースリクエストを送る
+		unsigned prev = g_nt_resolution_100ns.exchange(0);
+		if (prev)
+		{
+			ULONG cur = 0;
+			fn((ULONG)prev, FALSE, &cur);
+		}
+		return 0;
+	}
+
+	ULONG cur = 0;
+	NTSTATUS st = fn((ULONG)hundreds_ns, TRUE, &cur);
+	if (!NT_SUCCESS(st)) return -1;
+
+	unsigned prev = g_nt_resolution_100ns.exchange(hundreds_ns);
+	if (prev && prev != hundreds_ns)
+	{
+		// 前のリクエストを解除（新しい値が既に有効）
+		fn((ULONG)prev, FALSE, &cur);
+	}
+	return 0;
+}
+
+USLEEP_API void usleep_shutdown_nt_resolution(void)
+{
+	unsigned prev = g_nt_resolution_100ns.exchange(0);
+	if (!prev) return;
+	auto fn = get_NtSetTimerResolution();
+	if (fn)
+	{
+		ULONG cur = 0;
+		fn((ULONG)prev, FALSE, &cur);
+	}
+}
+
 USLEEP_API void usleep_get_stats(usleep_stats_t* out)
 {
 	if (!out) return;
@@ -408,6 +485,13 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
 		{
 			unsigned prev = g_time_period_ms.exchange(0);
 			if (prev) timeEndPeriod(prev);
+
+			unsigned nt_prev = g_nt_resolution_100ns.exchange(0);
+			if (nt_prev)
+			{
+				auto fn = get_NtSetTimerResolution();
+				if (fn) { ULONG cur = 0; fn((ULONG)nt_prev, FALSE, &cur); }
+			}
 		}
 	}
 	return TRUE;

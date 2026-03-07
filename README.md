@@ -33,6 +33,11 @@
 | **STRICT** | 低ジッタ重視。スピン厚め、`SwitchToThread()` 寄り |
 | **LOW_POWER** | 省電力重視。`Sleep(1)` ベースでジッタは大きめ |
 
+### ⚡ NT ネイティブ API による高精度タイマー分解能制御（オプション）
+- `NtSetTimerResolution` (ntdll.dll) で **0.5 ms** 粒度のシステムタイマーを設定可能
+- `timeBeginPeriod(1)` の 1 ms より細かく、より精密な待機が実現しやすくなる
+- `usleep_query_nt_resolution()` で環境がサポートする最小分解能を事前確認できる
+
 ### 📊 ベンチ向け統計 API（スレッドローカル）
 - `spin_relax`（PAUSE/YIELD の呼び出し回数）
 - `yield_switch` / `yield_sleep0` / `yield_sleep1`
@@ -146,6 +151,41 @@ usleep_init_timer_resolution(1);   // 必要時のみ（システム全体に影
 usleep_shutdown_timer_resolution();
 ```
 
+### 7) **NT ネイティブ API で 0.5 ms 粒度のタイマー分解能を設定（任意・高精度版）**
+
+`timeBeginPeriod(1)` は最小 1 ms 粒度ですが、`usleep_init_nt_resolution` を使うと
+多くの環境で **0.5 ms (5000 × 100 ns)** まで細かくなり、待機精度が向上します。
+
+```cpp
+// 1. まず環境がサポートする分解能を確認する
+unsigned min_res = 0, max_res = 0, cur_res = 0;
+if (usleep_query_nt_resolution(&min_res, &max_res, &cur_res) == 0) {
+    // min_res: 最も粗い値 (例: 156250 = 15.625 ms)
+    // max_res: 最も細かい値 (例: 5000  =  0.5  ms)  ← これを使う
+    // cur_res: 現在の設定
+}
+
+// 2. 最高精度で設定（max_res を使うか、固定値 5000 を指定）
+usleep_init_nt_resolution(max_res);   // 環境依存の最大精度
+// または
+usleep_init_nt_resolution(5000);      // 0.5 ms 固定（対応環境のみ有効）
+
+// 3. 通常通り待機（内部のタイマー粒度が向上した状態で動作）
+usleep_win(800);   // 800 µs 待機
+
+// 4. 終了時に必ず解除（システム全体への影響を戻す）
+usleep_shutdown_nt_resolution();
+```
+
+> **注意**: `timeBeginPeriod` と同様にシステム全体に影響します。
+> アプリ終了時、または不要になった時点で必ず `usleep_shutdown_nt_resolution()` を呼んでください。
+> `NtSetTimerResolution` は undocumented API ですが、Win2000 以降で安定して動作します。
+
+| API | 粒度 |
+| --- | --- |
+| `timeBeginPeriod(1)` | 最小 **1.0 ms** |
+| `usleep_init_nt_resolution(5000)` | 最小 **0.5 ms**（対応環境） |
+
 ---
 
 ## 🔧 プロファイルのチューニングガイド
@@ -182,6 +222,28 @@ bench_usleep_csv.exe 2000 1000 200 2 > result.csv
 ```
 iter,late_us,cpu_pct,spin_relax,yield_switch,yield_sleep0,yield_sleep1,timer_used
 ```
+
+### 実測比較（2026-03-07）
+
+以下は同一環境で `2000 iter / 1000us tick` を 3 回ずつ実行し、各指標を平均した結果です。
+
+- OS: Windows 10.0.26200.7922
+- CPU: AMD Ryzen 7 5800H with Radeon Graphics
+- プロファイル: `USLP_BALANCED` 固定
+- 集計元: `bench_outputs/summary_runs.csv` / `bench_outputs/summary_agg.csv`
+
+| config | 設定 | avg_late_us | p95_late_us | p99_late_us | max_late_us | avg_cpu_pct |
+|---|---|---:|---:|---:|---:|---:|
+| balanced_none_spin200 | `yield=NONE, spin=200` | 0.14 | 1.00 | 1.00 | 57.67 | 99.96 |
+| balanced_sleep0_spin200 | `yield=SLEEP0, spin=200` | 0.25 | 0.67 | 1.00 | 115.33 | 99.46 |
+| balanced_sleep0_spin300 | `yield=SLEEP0, spin=300` | 0.29 | 1.00 | 1.00 | 132.33 | 99.43 |
+| balanced_switch_spin200 | `yield=SWITCH_THREAD, spin=200` | 0.31 | 0.33 | 1.00 | 203.33 | 98.90 |
+| balanced_sleep1_spin200 | `yield=SLEEP1, spin=200` | 7505.87 | 14403.00 | 15150.00 | 15876.33 | 0.02 |
+
+補足:
+- `SLEEP1` は CPU 使用率を大幅に下げる代わりに、1ms 周期用途では遅延が大きくなる傾向です。
+- `NONE/SLEEP0/SWITCH_THREAD` はいずれも低遅延ですが、CPU 使用率は高めになります。
+- 本ベンチでは `timer_used=0` で、waitable timer ではなく主にスピン/譲りで収束していることを示しています。
 
 ---
 

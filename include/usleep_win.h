@@ -69,6 +69,13 @@ USLEEP_API void 	usleep_until_steady_us(uint64_t target_us);
 USLEEP_API int	usleep_init_timer_resolution(unsigned int ms);
 USLEEP_API void usleep_shutdown_timer_resolution(void);
 
+// NT ネイティブ API による高精度タイマー分解能制御 (100ns 単位)
+// hundreds_ns の目安: 5000 = 500µs (最高精度), 10000 = 1ms, 0 = 解除
+// usleep_query_nt_resolution で min/max/cur を事前確認推奨
+USLEEP_API int	usleep_query_nt_resolution(unsigned int* min_100ns, unsigned int* max_100ns, unsigned int* cur_100ns);
+USLEEP_API int	usleep_init_nt_resolution(unsigned int hundreds_ns);
+USLEEP_API void usleep_shutdown_nt_resolution(void);
+
 USLEEP_API int	usleep_set_profile(int profile);
 USLEEP_API int	usleep_set_spin_last_us(unsigned int us);
 USLEEP_API int	usleep_set_yield_policy(int policy);
