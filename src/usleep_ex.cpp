@@ -104,6 +104,18 @@ struct UsleepConfig
 };
 static thread_local UsleepConfig t_cfg;
 
+// プロファイルごとの内部閾値テーブル
+struct ProfileThresholds
+{
+	uint64_t timer_first_us;
+	uint64_t prefer_spin_below;
+};
+static constexpr ProfileThresholds kProfileThresholds[] = {
+	/* BALANCED  */ { 2000, 200 },
+	/* STRICT    */ { 1500, 500 },
+	/* LOW_POWER */ { 1000,   0 },
+};
+
 static inline LARGE_INTEGER qpc_freq()
 {
 	static LARGE_INTEGER f = []{ LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
@@ -119,7 +131,7 @@ static inline uint64_t qpc_now_us()
 	const uint64_t r = ticks % f;
 	if (q > (UINT64_MAX / 1000000ULL)) return UINT64_MAX;
 	const uint64_t base_us = q * 1000000ULL;
-	const uint64_t rem_us = (uint64_t)(((long double)r * 1000000.0L) / (long double)f);
+	const uint64_t rem_us  = (r * 1000000ULL) / f;
 	if (base_us > (UINT64_MAX - rem_us)) return UINT64_MAX;
 	return base_us + rem_us;
 }
@@ -207,15 +219,9 @@ static void do_sleep_us(uint64_t usec)
 	const unsigned spin_last_us = t_cfg.spin_last_us;
 	const UsleepYieldPolicy yield_policy = t_cfg.yield_policy;
 
-	uint64_t timer_first_us;
-	uint64_t prefer_spin_below;
-
-	switch (prof)
-	{
-	case USLP_STRICT:	 timer_first_us = 1500; prefer_spin_below = 500; break;
-	case USLP_LOW_POWER: timer_first_us = 1000; prefer_spin_below = 0;	 break;
-	default:			 timer_first_us = 2000; prefer_spin_below = 200; break;
-	}
+	const int pidx = (prof >= USLP_BALANCED && prof <= USLP_LOW_POWER) ? prof : USLP_BALANCED;
+	const uint64_t timer_first_us   = kProfileThresholds[pidx].timer_first_us;
+	const uint64_t prefer_spin_below = kProfileThresholds[pidx].prefer_spin_below;
 
 	const uint64_t now_us = qpc_now_us();
 	const uint64_t target_us = (usec > (UINT64_MAX - now_us)) ? UINT64_MAX : (now_us + usec);
@@ -233,13 +239,9 @@ static void do_sleep_us(uint64_t usec)
 			{
 				t_stat_timer_uses++;
 				WaitForSingleObject(h, INFINITE);
-				if (spin_last_us > 0)
+				if (prof != USLP_LOW_POWER)
 				{
 					spin_with_yield_until_us(target_us, 0, USLP_YIELD_NONE);
-				}
-				else if (prof != USLP_LOW_POWER)
-				{
-					while (qpc_now_us() < target_us) cpu_relax();
 				}
 				return;
 			}
@@ -312,10 +314,15 @@ USLEEP_API int usleep_init_timer_resolution(unsigned int ms)
 	return -1;
 }
 
-USLEEP_API void usleep_shutdown_timer_resolution()
+static void shutdown_timer_resolution_impl()
 {
 	unsigned prev = g_time_period_ms.exchange(0);
 	if (prev) timeEndPeriod(prev);
+}
+
+USLEEP_API void usleep_shutdown_timer_resolution()
+{
+	shutdown_timer_resolution_impl();
 }
 
 USLEEP_API int usleep_set_profile(int profile)
@@ -353,18 +360,19 @@ USLEEP_API int usleep_set_yield_policy(int policy)
 	return 0;
 }
 
+using PFN_SetThreadInformation = BOOL (WINAPI*)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+static PFN_SetThreadInformation get_SetThreadInformation()
+{
+	static auto fn = (PFN_SetThreadInformation)GetProcAddress(
+		GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+	return fn;
+}
+
 USLEEP_API int usleep_set_power_mode(int mode)
 {
 	if (mode < USLP_POWER_DEFAULT || mode > USLP_POWER_ECO) return -1;
 
-	using PFN_SetThreadInformation = BOOL (WINAPI*)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
-	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-	if (!k32)
-	{
-		t_cfg.power_mode = (UsleepPowerMode)mode;
-		return 0;
-	}
-	auto pSetThreadInformation = (PFN_SetThreadInformation)GetProcAddress(k32, "SetThreadInformation");
+	auto pSetThreadInformation = get_SetThreadInformation();
 	if (!pSetThreadInformation)
 	{
 		t_cfg.power_mode = (UsleepPowerMode)mode;
@@ -438,7 +446,7 @@ USLEEP_API int usleep_init_nt_resolution(unsigned int hundreds_ns)
 	return 0;
 }
 
-USLEEP_API void usleep_shutdown_nt_resolution(void)
+static void shutdown_nt_resolution_impl()
 {
 	unsigned prev = g_nt_resolution_100ns.exchange(0);
 	if (!prev) return;
@@ -448,6 +456,11 @@ USLEEP_API void usleep_shutdown_nt_resolution(void)
 		ULONG cur = 0;
 		fn((ULONG)prev, FALSE, &cur);
 	}
+}
+
+USLEEP_API void usleep_shutdown_nt_resolution(void)
+{
+	shutdown_nt_resolution_impl();
 }
 
 USLEEP_API void usleep_get_stats(usleep_stats_t* out)
@@ -483,15 +496,8 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
 
 		if (reason == DLL_PROCESS_DETACH)
 		{
-			unsigned prev = g_time_period_ms.exchange(0);
-			if (prev) timeEndPeriod(prev);
-
-			unsigned nt_prev = g_nt_resolution_100ns.exchange(0);
-			if (nt_prev)
-			{
-				auto fn = get_NtSetTimerResolution();
-				if (fn) { ULONG cur = 0; fn((ULONG)nt_prev, FALSE, &cur); }
-			}
+			shutdown_timer_resolution_impl();
+			shutdown_nt_resolution_impl();
 		}
 	}
 	return TRUE;

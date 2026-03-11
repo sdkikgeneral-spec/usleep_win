@@ -1,0 +1,5 @@
+{
+    "C_Cpp.default.compileCommands": "d:\\Develop\\Projects\\usleep_win\\builddir/compile_commands.json",
+    "C_Cpp.default.configurationProvider": "mesonbuild.mesonbuild",
+    "makefile.configureOnOpen": true
+}

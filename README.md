@@ -192,26 +192,13 @@ usleep_shutdown_nt_resolution();
 
 ## 🔧 プロファイルのチューニングガイド
 
-### 1. BALANCED（既定）
-- ジッタ: ★★★ / CPU: ★★☆ / 公平性: ★★★
-- 運用: 残りが長い区間は `Sleep(0)` で譲り、最後の ~250µs をスピン
-- 用途: 1ms 周期のメインループ、I/O ポーリング、ゲーム/サーバーに最適
+プロファイル別の閾値テーブル・チューニング詳細・ベンチマーク結果は **[実装仕様書 (specsheet.md)](./document/specsheet.md)** を参照してください。
 
-### 2. STRICT（低ジッタ）
-- ジッタ: ★★★★ / CPU: ★★★★ / 公平性: ★★☆
-- 運用: スピン厚め（300–500µs）、`SwitchToThread()` を周期的に使用
-- 用途: レイテンシ重視、制御ループ、計測・オーディオ等
-
-### 3. LOW_POWER（省電力）
-- ジッタ: ★☆☆☆ / CPU: ★☆☆☆ / 公平性: ★★★★
-- 運用: `Sleep(1)` 中心、スピンはゼロか短時間
-- 用途: バックグラウンド処理、省電力サーバー
-
-#### スピン/イールド微調整のコツ
-- `usleep_set_spin_last_us(200〜400)` : 長く→ジッタ↓/CPU↑、短く→CPU↓/ジッタ↑
-- `usleep_set_yield_policy(...)` : `SLEEP0`（既定）、`SWITCH_THREAD`（局所性）、`SLEEP1`（省電力）
-
----
+| プロファイル | ジッタ | CPU | 公平性 | 用途 |
+|---|---|---|---|---|
+| **BALANCED**（既定） | ★★★ | ★★☆ | ★★★ | 1ms メインループ、ゲーム/サーバー |
+| **STRICT** | ★★★★ | ★★★★ | ★★☆ | レイテンシ重視、オーディオ |
+| **LOW_POWER** | ★☆☆☆ | ★☆☆☆ | ★★★★ | バックグラウンド、省電力 |
 
 ## 📊 ベンチマーク（CSV 出力）
 `tools/bench_usleep_csv.cpp` を使うと、イテレーションごとに遅着/CPU%/譲り回数などを CSV で出力できます。
@@ -225,27 +212,7 @@ bench_usleep_csv.exe 2000 1000 200 2 > result.csv
 iter,late_us,cpu_pct,spin_relax,yield_switch,yield_sleep0,yield_sleep1,timer_used
 ```
 
-### 実測比較（2026-03-07）
-
-以下は同一環境で `2000 iter / 1000us tick` を 3 回ずつ実行し、各指標を平均した結果です。
-
-- OS: Windows 10.0.26200.7922
-- CPU: AMD Ryzen 7 5800H with Radeon Graphics
-- プロファイル: `USLP_BALANCED` 固定
-- 集計元: `bench_outputs/summary_runs.csv` / `bench_outputs/summary_agg.csv`
-
-| config | 設定 | avg_late_us | p95_late_us | p99_late_us | max_late_us | avg_cpu_pct |
-|---|---|---:|---:|---:|---:|---:|
-| balanced_none_spin200 | `yield=NONE, spin=200` | 0.14 | 1.00 | 1.00 | 57.67 | 99.96 |
-| balanced_sleep0_spin200 | `yield=SLEEP0, spin=200` | 0.25 | 0.67 | 1.00 | 115.33 | 99.46 |
-| balanced_sleep0_spin300 | `yield=SLEEP0, spin=300` | 0.29 | 1.00 | 1.00 | 132.33 | 99.43 |
-| balanced_switch_spin200 | `yield=SWITCH_THREAD, spin=200` | 0.31 | 0.33 | 1.00 | 203.33 | 98.90 |
-| balanced_sleep1_spin200 | `yield=SLEEP1, spin=200` | 7505.87 | 14403.00 | 15150.00 | 15876.33 | 0.02 |
-
-補足:
-- `SLEEP1` は CPU 使用率を大幅に下げる代わりに、1ms 周期用途では遅延が大きくなる傾向です。
-- `NONE/SLEEP0/SWITCH_THREAD` はいずれも低遅延ですが、CPU 使用率は高めになります。
-- 本ベンチでは `timer_used=0` で、waitable timer ではなく主にスピン/譲りで収束していることを示しています。
+ベンチマーク実測結果は **[テスト結果 (test_result.md)](./document/test_result.md)** を参照してください。
 
 ---
 
