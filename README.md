@@ -1,3 +1,8 @@
+# Overview
+
+This repository provides a lightweight, open-source Windows-compatible implementation of `usleep`,
+maintained as a supporting utility within a broader education-oriented and cross-platform software ecosystem.
+
 # usleep_win
 高精度・低ジッタな Windows 用 `usleep()` 実装（WaitableTimer + QPC + YieldProcessor）
 
