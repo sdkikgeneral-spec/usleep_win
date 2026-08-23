@@ -2,6 +2,8 @@
 
 本ドキュメントは `usleep_win` ライブラリの内部設計・API 仕様・チューニングガイドをまとめた技術仕様書です。
 
+対象バージョン: **v0.2.1**（`meson.build` の `version:` / `resource/usleep_win.rc` の FILEVERSION / `USLEEP_WIN_VERSION_STRING` と一致）
+
 ---
 
 ## 目次
@@ -12,8 +14,9 @@
 4. [プロファイル定義と閾値](#プロファイル定義と閾値)
 5. [チューニングガイド](#チューニングガイド)
 6. [NT ネイティブ API によるタイマー分解能制御](#nt-ネイティブ-api-によるタイマー分解能制御)
-7. [スレッドローカル設計](#スレッドローカル設計)
+7. [状態のスコープ（スレッドローカル / プロセス全体）](#状態のスコープスレッドローカル--プロセス全体)
 8. [DllMain クリーンアップ](#dllmain-クリーンアップ)
+9. [ビルドと利用形態](#ビルドと利用形態)
 
 ---
 
@@ -29,25 +32,48 @@ usleep_win(usec) / usleep_until_steady_us(target)
   │
   ▼
 do_sleep_us(usec)
-  ├─ usec >= timer_first_us → WaitableTimer + tail spin
-  ├─ usec > prefer_spin_below (HR timer あり) → WaitableTimer + tail spin
-  ├─ LOW_POWER → spin_with_yield_until_us(..., SLEEP1)
-  └─ それ以外 → spin_with_yield_until_us(..., yield_policy)
+  ├─ usec == 0                                        → SwitchToThread()
+  ├─ usec >= timer_first_us                           → WaitableTimer + tail spin
+  ├─ can_hr && usec > prefer_spin_below               → WaitableTimer + tail spin
+  ├─ LOW_POWER                                        → spin_with_yield_until_us(..., SLEEP1)
+  └─ それ以外                                          → spin_with_yield_until_us(..., yield_policy)
 ```
+
+分岐条件は 1 本の式で表現される。
+
+```cpp
+if (usec >= timer_first_us || (can_hr && usec > prefer_spin_below))
+```
+
+`can_hr` は `probe_hrtimer_support()` の戻り値（高分解能 WaitableTimer の可用性）。
+閾値 `timer_first_us` / `prefer_spin_below` は `kProfileThresholds[]` から引く。
 
 ### 時刻取得: `qpc_now_us()`
 
 - `QueryPerformanceCounter` / `QueryPerformanceFrequency` を使用
-- 周波数は初回呼び出し時に static 変数にキャッシュ（不変値）
+- 周波数はブート中不変なので、プロセスグローバルな `std::atomic<uint64_t> g_qpc_freq` にキャッシュ
+  （関数ローカル `static` の magic static は CRT の once ロックを取るため意図的に避けている）
 - µs への変換は純粋整数演算 `(ticks / freq) * 1000000 + (ticks % freq) * 1000000 / freq`
 - オーバーフロー保護: 商が `UINT64_MAX / 1000000` を超える場合は `UINT64_MAX` を返す
+
+### 高分解能タイマーの可用性判定: `probe_hrtimer_support()`
+
+- `CreateWaitableTimerExW` を `kernel32.dll` から `GetProcAddress` で動的解決し、
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` 付きで実際に 1 本作成できるかを試す
+- 判定は **プロセス全体で一度だけ**（`g_hrtimer_probed` / `g_has_hrtimer`）行い、以後不変
+- 試作したハンドルは破棄せず、そのスレッドの `t_timer` として使い回す
+- 判定は `do_sleep_us()` の入口で行われるため、**短い待機しかしないスレッドでも
+  可用性が正しく反映される**（旧実装は `get_timer_handle()` が一度も呼ばれないスレッドで
+  `g_has_hrtimer` が false のままとなり、HR タイマー経路に入れず純スピンし続けていた）
+- 競合時は複数スレッドが同じ判定を行うだけなので同期プリミティブは使わない
 
 ### タイマーハンドル: `get_timer_handle()`
 
 - スレッドローカル `t_timer` にキャッシュ
-- `CreateWaitableTimerExW` で `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` フラグを試行
-- 成功すれば High-Resolution Timer（100ns 分解能）
-- 失敗した場合は `CreateWaitableTimerW` でフォールバック
+- `probe_hrtimer_support()` が真なら `CreateWaitableTimerExW` +
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` でハンドルを作成（100ns 分解能）
+- 偽、または HR ハンドル作成に失敗した場合は `CreateWaitableTimerW` でフォールバック
+  （このときプロセス全体の `g_has_hrtimer` は書き換えない。スコープが異なるため）
 - `DllMain(DLL_THREAD_DETACH)` でハンドルを確実にクローズ
 
 ---
@@ -60,18 +86,26 @@ do_sleep_us(usec)
 
 ### フロー詳細
 
-1. **WaitableTimer フェーズ** (`usec >= timer_first_us`)
+1. **WaitableTimer フェーズ** (`usec >= timer_first_us || (can_hr && usec > prefer_spin_below)`)
    - `SetWaitableTimer` で `(usec - spin_last_us)` 分だけ粗く待機
+     （`spin_last_us == 0` または `usec <= spin_last_us` のときは `usec` そのまま）
    - `WaitForSingleObject(INFINITE)` でブロック（CPU 消費ゼロ）
 
-2. **テールスピンフェーズ** (`spin_last_us > 0`)
-   - QPC で現在時刻を繰り返しポーリング
-   - `YieldProcessor()` (x86: `PAUSE` / ARM64: `YIELD`) を毎イテレーション実行
-   - 64 イテレーション毎に `yield_policy` に基づくリラックス処理を挿入
+2. **テールスピンフェーズ**
+   - タイマー復帰後は `spin_with_yield_until_us(target, 0, USLP_YIELD_NONE)` を呼ぶため、
+     **締切までは譲らない純スピン**（`YieldProcessor()` のみ）
+   - `LOW_POWER` プロファイルではこのテールスピンを行わず、タイマー復帰で即座に返る
+   - タイマーを使わないスピン経路では、残り時間が `spin_last_us` を超えている間だけ
+     64 イテレーションに 1 回 `yield_policy` に基づくリラックス処理を挿入し、
+     残りが `spin_last_us` 以下になったら純スピンに切り替える
 
 3. **フォールバック** (タイマーの取得/セットに失敗した場合)
-   - `Sleep(ms)` + テールスピン
-   - `usec < 1000` の場合はスピンオンリー
+   - `usec >= 1000` なら `Sleep(usec / 1000)` + 純スピンで締切まで詰める
+   - `usec < 1000` の場合はスピン経路（4. と同じ）へフォールスルー
+
+4. **スピン経路**（タイマー条件を満たさない場合）
+   - `LOW_POWER` は `spin_with_yield_until_us(target, 0, USLP_YIELD_SLEEP1)`
+   - それ以外は `spin_with_yield_until_us(target, spin_last_us, yield_policy)`
 
 ### スピンリラックスの動作
 
@@ -89,6 +123,43 @@ spin_with_yield_until_us():
 ---
 
 ## API 仕様
+
+### リンケージと呼び出し規約
+
+公開 API はすべて `extern "C"` で、次の 2 つのマクロを介して宣言される。
+
+```c
+USLEEP_API <戻り値> USLEEP_CALL <関数名>(...);
+```
+
+| マクロ | 定義 | 用途 |
+|---|---|---|
+| `USLEEP_API` | `__declspec(dllexport)` / `__declspec(dllimport)` / 空 | リンケージ |
+| `USLEEP_CALL` | MSVC: `__cdecl` / GCC・Clang(x86): `__attribute__((__cdecl__))` / その他: 空 | 呼び出し規約 |
+
+- `USLEEPWIN_EXPORTS` を定義してビルドすると `dllexport`（DLL 本体側）
+- `USLEEPWIN_STATIC` を定義すると `dllimport` を抑止（静的リンク／ソース直接取り込み時）
+- どちらも未定義なら `dllimport`（DLL 利用者側の既定）
+- 呼び出し規約を明示しているため、**利用者が `/Gz`(stdcall) や `/Gr`(fastcall) で
+  ビルドしていても x86 でスタックが壊れない**。x64 / ARM64 は規約が 1 つしかないため実質無害な指定になる。
+
+### バージョン照会
+
+ヘッダ側のマクロ（コンパイル時の値）と DLL 側の関数（実行時の値）を照合できる。
+
+| 名前 | 種別 | 値 / シグネチャ | 説明 |
+|---|---|---|---|
+| `USLEEP_WIN_VERSION_MAJOR` | マクロ | `0` | メジャー |
+| `USLEEP_WIN_VERSION_MINOR` | マクロ | `2` | マイナー |
+| `USLEEP_WIN_VERSION_PATCH` | マクロ | `1` | パッチ |
+| `USLEEP_WIN_VERSION_STRING` | マクロ | `"0.2.1"` | 文字列表現 |
+| `USLEEP_WIN_VERSION_NUM` | マクロ | `major<<16 \| minor<<8 \| patch` | 比較用のパック値 |
+| `usleep_win_version` | 関数 | `uint32_t usleep_win_version(void)` | ロード中の DLL のパック値 |
+| `usleep_win_version_string` | 関数 | `const char* usleep_win_version_string(void)` | ロード中の DLL のバージョン文字列 |
+
+- `usleep_win_version_string()` が返すのは静的な文字列リテラル。**解放不要・スレッド安全**
+- どちらの関数もスレッド非依存で、初期化前でも呼べる
+- DLL を差し替える運用では `usleep_win_version() != USLEEP_WIN_VERSION_NUM` で不整合を検出できる
 
 ### コア関数
 
@@ -116,7 +187,18 @@ spin_with_yield_until_us():
 | `usleep_set_profile` | `int usleep_set_profile(int profile)` | プロファイルを設定（`USLP_BALANCED` / `USLP_STRICT` / `USLP_LOW_POWER`）。成功時 0 |
 | `usleep_set_spin_last_us` | `int usleep_set_spin_last_us(unsigned int us)` | テールスピン長を µs で設定 |
 | `usleep_set_yield_policy` | `int usleep_set_yield_policy(int policy)` | イールド方針を設定 |
-| `usleep_set_power_mode` | `int usleep_set_power_mode(int mode)` | スレッド電力モードを設定（`SetThreadInformation` 使用） |
+| `usleep_set_power_mode` | `int usleep_set_power_mode(int mode)` | スレッド電力モードを設定（`SetThreadInformation` 使用）。成功時 0、失敗時 -1 |
+
+> **呼び出し順序に注意**: `usleep_set_profile()` は `spin_last_us` と `yield_policy` を
+> **上書きする**。個別に詰めたい場合は必ず `set_profile()` → `set_spin_last_us()` /
+> `set_yield_policy()` の順で呼ぶこと。逆順では設定が消える。
+
+> **v0.2.1 での修正**: 古い SDK 向けフォールバックで `THREAD_INFORMATION_CLASS` の
+> `ThreadPowerThrottling` を誤って `11` と定義していたため、`SetThreadInformation` が
+> `ERROR_INVALID_PARAMETER (87)` で失敗し、**`usleep_set_power_mode()` は全モードで常に -1 を返し、
+> 電力モードは一度も適用されていなかった**。正しい列挙値 `3` に修正済み。
+> なお `SetThreadInformation` 自体が解決できない古い Windows では、
+> 従来どおり設定値をスレッドローカルに記録して 0 を返す（実際の絞りは行われない）。
 
 ### 統計 API
 
@@ -124,6 +206,8 @@ spin_with_yield_until_us():
 |---|---|---|
 | `usleep_get_stats` | `void usleep_get_stats(usleep_stats_t* out)` | スレッドローカル統計を取得 |
 | `usleep_reset_stats` | `void usleep_reset_stats(void)` | スレッドローカル統計をリセット |
+
+> カウンタは呼び出したスレッドのもの。**別スレッドから読むと 0 が返る**。
 
 ### 統計構造体
 
@@ -158,7 +242,8 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 | **LOW_POWER** | 1000 | 0 | 0 | `USLP_YIELD_SLEEP1` |
 
 - `timer_first_us`: この値以上の待機で WaitableTimer を使用
-- `prefer_spin_below`: High-Resolution Timer が利用可能でも、この値未満はスピンオンリー
+- `prefer_spin_below`: High-Resolution Timer が利用可能な場合に、この値を超えたらタイマー経路に入る
+  （`LOW_POWER` は 0 なので、HR タイマーが使える環境では 1µs 以上の待機がすべてタイマー経路になる）
 - `spin_last_us`: WaitableTimer 後のテールスピン長
 - `yield_policy`: 64 イテレーション毎のリラックス方式
 
@@ -169,6 +254,10 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 | `USLP_BALANCED` | 250 | `USLP_YIELD_SLEEP0` |
 | `USLP_STRICT` | 400（既存値が 300 未満の場合） | `USLP_YIELD_SWITCH_THREAD` |
 | `USLP_LOW_POWER` | 0 | `USLP_YIELD_SLEEP1` |
+
+`UsleepConfig` の初期値（`set_profile()` を一度も呼ばないスレッド）は
+`profile = USLP_BALANCED` / `spin_last_us = 250` / `yield_policy = USLP_YIELD_SLEEP0` /
+`power_mode = USLP_POWER_DEFAULT`。
 
 ---
 
@@ -204,7 +293,10 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 
 ### 内部実装
 
-- `get_NtSetTimerResolution()` / `get_NtQueryTimerResolution()`: lazy-init static パターンで関数ポインタをキャッシュ
+- `get_NtSetTimerResolution()` / `get_NtQueryTimerResolution()`: `GetModuleHandleW(L"ntdll.dll")`
+  （ロードはしない）+ `GetProcAddress` で解決し、プロセスグローバルな `std::atomic` にキャッシュ。
+  関数ローカル `static` の初回初期化は CRT の once ロックを取り、DllMain 経路でデッドロックしうるため使わない
+- `peek_NtSetTimerResolution()`: DllMain 経路専用。解決済みのポインタを読むだけで `GetProcAddress` を行わない
 - `g_nt_resolution_100ns`: `std::atomic<unsigned>` で現在設定値を管理
 - 新しい値をセットする際、以前の値があればリリースリクエストを送信
 
@@ -221,7 +313,17 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 
 ---
 
-## スレッドローカル設計
+## 状態のスコープ（スレッドローカル / プロセス全体）
+
+状態は 2 種類あり、混同するとバグになる。
+
+| 状態 | スコープ | 該当 API |
+|---|---|---|
+| プロファイル / スピン長 / イールド方針 / 電力モード | **スレッドローカル** | `usleep_set_profile` / `usleep_set_spin_last_us` / `usleep_set_yield_policy` / `usleep_set_power_mode` |
+| 統計カウンタ | **スレッドローカル** | `usleep_get_stats` / `usleep_reset_stats` |
+| WaitableTimer ハンドル | **スレッドローカル** | 内部 (`get_timer_handle`) |
+| システムタイマー分解能 | **プロセス／システム全体** | `usleep_init_timer_resolution` / `usleep_init_nt_resolution` とその `shutdown` |
+| HR タイマー可用性 | **プロセス全体**（一度確定したら不変） | 内部 (`probe_hrtimer_support`) |
 
 ### スレッドローカル変数一覧
 
@@ -246,8 +348,16 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 | 変数 | 型 | 用途 |
 |---|---|---|
 | `g_time_period_ms` | `std::atomic<unsigned>` | `timeBeginPeriod` で設定した値 |
-| `g_has_hrtimer` | `std::atomic<bool>` | High-Resolution Timer の利用可否 |
+| `g_has_hrtimer` | `std::atomic<bool>` | High-Resolution Timer の利用可否（`probe_hrtimer_support` が確定） |
+| `g_hrtimer_probed` | `std::atomic<bool>` | 可用性判定を実施済みか |
+| `g_pCreateWaitableTimerExW` | `std::atomic<関数ポインタ>` | 動的解決した `CreateWaitableTimerExW` |
 | `g_nt_resolution_100ns` | `std::atomic<unsigned>` | NT API で設定した分解能 |
+| `g_qpc_freq` | `std::atomic<uint64_t>` | QPC 周波数のキャッシュ |
+| `g_pNtSetTimerResolution` / `g_pNtQueryTimerResolution` / `g_ntdll_resolved` | `std::atomic` | ntdll 関数ポインタと解決済みフラグ |
+| `g_pSetThreadInformation` / `g_sti_resolved` | `std::atomic` | `SetThreadInformation` の関数ポインタと解決済みフラグ |
+
+いずれも関数ローカル `static`（C++11 magic static）を使わないプレーンな `std::atomic` として保持している。
+DllMain（ローダロック保持中）から到達しうる経路で CRT の once ロックを取らないための措置。
 
 ---
 
@@ -262,3 +372,39 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 - `g_nt_resolution_100ns` の値で `NtSetTimerResolution(prev, FALSE, ...)` を呼び出し
 
 これにより、アプリケーションが `usleep_shutdown_*` を明示的に呼ばなくても、DLL アンロード時にシステム全体の設定が安全に復元される。
+
+> ただし `DLL_PROCESS_DETACH` は保険であり、通常は明示的に `usleep_shutdown_timer_resolution()` /
+> `usleep_shutdown_nt_resolution()` を呼ぶこと。`init` したら必ず対応する `shutdown` を呼ぶのが原則。
+
+---
+
+## ビルドと利用形態
+
+### ビルド方法
+
+| 方法 | コマンド | 備考 |
+|---|---|---|
+| Meson（推奨） | `meson setup build --buildtype=release && meson compile -C build && meson test -C build` | MSVC は x64 Native Tools プロンプトから |
+| MinGW / MSYS2 | `mingw32-make` / `mingw32-make test` | |
+| MSVC ラッパー | `powershell -ExecutionPolicy Bypass -File .\tools\meson_build_msvc.ps1 -RunTests` | WinError 5 で sanity 実行が拒否される環境向け |
+
+DLL 本体のビルドでは `USLEEPWIN_EXPORTS` を定義する（Meson / Makefile とも `-DUSLEEPWIN_EXPORTS` を付与済み）。
+
+### 利用形態
+
+| 形態 | 利用者側で定義するマクロ |
+|---|---|
+| DLL をインポートライブラリ経由で使う | なし（既定で `dllimport`） |
+| `src/usleep_ex.cpp` を自プロジェクトに取り込む／静的にリンクする | `USLEEPWIN_STATIC` |
+
+`USLEEPWIN_STATIC` を定義すると `USLEEP_API` が空になり、`__declspec(dllimport)` が付かなくなる。
+定義し忘れると、リンカが `__imp_` 付きシンボルを探して未解決になる。
+
+### ソースの文字コード
+
+`src/` `include/` `tests/` `tools/` のソースは **UTF-8 BOM 付き** で保存すること。
+
+- MSVC は BOM が無いと実行環境の ANSI コードページ（日本語環境では CP932）としてソースを読む
+- DLL 本体は `meson.build` / `Makefile` 側で `/utf-8` を渡しているが、**公開ヘッダ
+  `include/usleep_win.h` は利用者のビルド設定を選べない**。BOM が無いと利用者側で C4819 が出るうえ、
+  日本語コメント直後の宣言が食い潰される危険がある

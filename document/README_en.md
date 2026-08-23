@@ -10,6 +10,8 @@ High-accuracy, low-jitter `usleep()` for Windows (WaitableTimer + QPC + YieldPro
 - Server-friendly **BALANCED** preset (default)
 - Built-in **stats API** for benchmarking
 - **Deadline-based** `usleep_until_steady_us()` to minimize drift
+- **C ABI with a pinned calling convention** (`USLEEP_CALL` = `__cdecl` on MSVC)
+- **Version query API** to match the loaded DLL against the header you compiled with
 
 > Note: Windows is not a hard real-time OS. Microsecond-scale waits are subject to power policies, virtualization, and system load.
 
@@ -23,7 +25,8 @@ High-accuracy, low-jitter `usleep()` for Windows (WaitableTimer + QPC + YieldPro
 
 ### 🧵 CPU-friendly waiting
 - Emits `YieldProcessor()` during spin
-- Inserts **periodic yield every 64 iterations** (`Sleep(0)` / `SwitchToThread()`) to improve fairness and reduce heat/noise
+- While still far from the deadline, inserts a **yield every 64 iterations** (`Sleep(0)` / `SwitchToThread()`) to improve fairness and reduce heat/noise
+- Over the final `spin_last_us` it switches to a pure, non-yielding spin to tighten the landing
 - Avoids pure busy-wait
 
 ### 🖥 Profiles
@@ -43,6 +46,45 @@ High-accuracy, low-jitter `usleep()` for Windows (WaitableTimer + QPC + YieldPro
 - `yield_switch` / `yield_sleep0` / `yield_sleep1`
 - `waitable_timer_uses`
 
+### 🧩 State scope (important)
+
+Settings and stats are **thread-local**; timer resolution is **process/system-wide**. Mixing the two up causes bugs.
+
+| State | Scope | API |
+|---|---|---|
+| Profile / tail spin / yield policy / power mode | **Thread-local** | `usleep_set_profile` / `usleep_set_spin_last_us` / `usleep_set_yield_policy` / `usleep_set_power_mode` |
+| Stats counters | **Thread-local** | `usleep_get_stats` / `usleep_reset_stats` |
+| WaitableTimer handle | **Thread-local** | managed internally |
+| System timer resolution | **Process / system-wide** | `usleep_init_timer_resolution` / `usleep_init_nt_resolution` |
+
+- Configure every worker thread separately; one thread's settings never affect another.
+- **Reading the stats from a different thread returns zeros.**
+- Timer resolution is system-wide. Every `init_*` must be paired with the matching `shutdown_*` — the OS does not restore it for you.
+
+### 🔖 Version query
+
+Compare the header macros (compile time) with the DLL functions (run time).
+
+```cpp
+// Compile-time values
+// USLEEP_WIN_VERSION_MAJOR / _MINOR / _PATCH
+// USLEEP_WIN_VERSION_STRING  -> "0.2.1"
+// USLEEP_WIN_VERSION_NUM     -> (major<<16) | (minor<<8) | patch
+
+if (usleep_win_version() != USLEEP_WIN_VERSION_NUM) {
+    printf("DLL is %s, header is %s\n",
+           usleep_win_version_string(), USLEEP_WIN_VERSION_STRING);
+}
+```
+
+- `usleep_win_version()` returns a packed `uint32_t` (`major<<16 | minor<<8 | patch`).
+- `usleep_win_version_string()` returns a **static string literal** — never free it; it is thread-safe.
+- Current version is **0.2.1** (consistent across `meson.build`, `usleep_win.rc`, and the header).
+
+> **Fixed in 0.2.1**: `usleep_set_power_mode()` used a wrong internal constant for
+> `ThreadPowerThrottling`, so it **always returned -1 for every mode and the power mode was never applied**.
+> This is now fixed.
+
 ---
 
 ## 📦 Build & Install
@@ -51,12 +93,38 @@ High-accuracy, low-jitter `usleep()` for Windows (WaitableTimer + QPC + YieldPro
 ```bash
 meson setup build --buildtype=release
 meson compile -C build
+meson test -C build
 ```
+With MSVC, run these from an **x64 Native Tools Command Prompt**.
 
 ### MinGW (Makefile)
 ```bash
 mingw32-make
+mingw32-make test
 ```
+
+### When the MSVC sanity check is blocked with WinError 5
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\meson_build_msvc.ps1 -RunTests
+```
+
+### Linkage macros
+
+| How you use it | Macro you define |
+|---|---|
+| Consume the DLL through its import library | none (defaults to `__declspec(dllimport)`) |
+| Compile `src/usleep_ex.cpp` into your own target / link statically | **`USLEEPWIN_STATIC`** |
+| Build the DLL itself | `USLEEPWIN_EXPORTS` (added automatically by Meson / the Makefile) |
+
+Defining `USLEEPWIN_STATIC` drops `__declspec(dllimport)`. Forget it and the linker will
+look for `__imp_`-prefixed symbols and fail to resolve them.
+
+### Calling convention
+
+Every public function is declared with `USLEEP_CALL` (`__cdecl` on MSVC), so the
+convention is pinned regardless of your compiler switches. **Building your code with
+`/Gz` (stdcall) or `/Gr` (fastcall) is safe** — a mismatch would corrupt the stack on x86.
+On x64 / ARM64 there is only one convention, so the annotation is effectively a no-op.
 
 > **Note**: `timeBeginPeriod(1)` affects the whole system. This library does not change it by default. Call `usleep_init_timer_resolution(1)` only when strictly needed and revert with `usleep_shutdown_timer_resolution()`.
 
@@ -135,6 +203,20 @@ usleep_set_yield_policy(USLP_YIELD_SLEEP1);        // stronger yield (higher jit
 usleep_set_spin_last_us(250);  // recommended: 200–400
 ```
 
+> **⚠ Call order matters**: `usleep_set_profile()` **overwrites both `spin_last_us` and
+> `yield_policy`**. To keep custom values, always call **`set_profile()` first**, then
+> `set_spin_last_us()` / `set_yield_policy()`. The reverse order silently discards your values.
+
+```cpp
+// ❌ discarded
+usleep_set_spin_last_us(400);
+usleep_set_profile(USLP_BALANCED);   // resets spin_last_us back to 250
+
+// ✅ kept
+usleep_set_profile(USLP_BALANCED);
+usleep_set_spin_last_us(400);
+```
+
 ### 5) **Read per-thread stats (for benchmarking)**
 ```cpp
 usleep_stats_t st{};
@@ -143,6 +225,8 @@ usleep_get_stats(&st);
 printf("spin_relax=%llu\n", (unsigned long long)st.spin_relax);
 printf("yield_sleep0=%llu\n", (unsigned long long)st.yield_sleep0);
 ```
+
+> The counters belong to the calling thread. **Reading them from another thread returns zeros.**
 
 ### 6) **Optional: enable 1 ms timer resolution**
 ```cpp
@@ -231,6 +315,8 @@ The following results were measured on the same machine, running `2000 iter / 10
 - OS: Windows 10.0.26200.7922
 - CPU: AMD Ryzen 7 5800H with Radeon Graphics
 - Profile: fixed to `USLP_BALANCED`
+- Power plan, timer-resolution settings, background load, and the exact library version were **not recorded** for this run,
+  so treat the absolute numbers as indicative only — they are comparable within this table, not across machines
 - Data source: `bench_outputs/summary_runs.csv` / `bench_outputs/summary_agg.csv`
 
 | config | setting | avg_late_us | p95_late_us | p99_late_us | max_late_us | avg_cpu_pct |
@@ -245,6 +331,8 @@ Notes:
 - `SLEEP1` drastically reduces CPU usage, but latency becomes much larger for 1 ms periodic workloads.
 - `NONE/SLEEP0/SWITCH_THREAD` keep latency low, but CPU usage remains high.
 - In this benchmark, `timer_used=0`, which indicates convergence mainly by spin/yield behavior rather than waitable timer usage.
+- Windows is not a hard real-time OS: these figures are a snapshot of one machine under one configuration, not a guarantee.
+- See **[test results (test_result.md)](./test_result.md)** for the full measurement log.
 
 ---
 
@@ -271,3 +359,15 @@ This repository is licensed under the MIT License. See [LICENSE](../LICENSE) for
 
 ## 🤝 Contributing
 Issues and PRs are welcome—tuning ideas, improvements, and measurement reports are highly appreciated.
+
+### Source encoding
+Save sources under `src/`, `include/`, `tests/`, and `tools/` as **UTF-8 with BOM**.
+
+- Without a BOM, MSVC reads the file using the system ANSI code page (CP932 on Japanese systems).
+- This matters most for the public header `include/usleep_win.h`: it **cannot control the
+  consumer's compiler flags** (`/utf-8` may be absent), so a missing BOM produces C4819 on the
+  consumer side and can swallow declarations that follow a Japanese comment.
+
+### Reporting measurements
+Always state the measurement conditions: CPU, OS build, power plan, timer-resolution settings,
+and any concurrent load. Numbers without conditions cannot be compared.
