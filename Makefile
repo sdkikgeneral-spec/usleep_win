@@ -5,6 +5,7 @@
 #   mingw32-make clean
 
 CXX ?= g++
+WINDRES ?= windres
 # 警告レベルは meson.build の warning_level=3（MSVC の /W4 相当）と揃える。
 # ソースは UTF-8 だが g++ は入力・実行文字セットとも既定が UTF-8 のため
 # -finput-charset/-fexec-charset の明示は不要（MSVC 側のみ /utf-8 が要る）。
@@ -23,6 +24,11 @@ TEST_SRC := tests/test_usleep.cpp
 BENCH_EXE := $(BUILD)/bench_usleep_csv.exe
 BENCH_SRC := tools/bench_usleep_csv.cpp
 
+# バージョンリソース。meson.build 側は windows.compile_resources() で必ず
+# 埋め込むので、Makefile 側でも同じ成果物になるよう windres で埋め込む。
+RC_SRC := resource/usleep_win.rc
+RC_OBJ := $(BUILD)/usleep_win_rc.o
+
 .PHONY: all run test clean
 
 all: $(DLL) $(TEST_EXE) $(BENCH_EXE)
@@ -30,8 +36,11 @@ all: $(DLL) $(TEST_EXE) $(BENCH_EXE)
 $(BUILD):
 	@mkdir -p $(BUILD)
 
-$(DLL): $(SRC) include/usleep_win.h | $(BUILD)
-	$(CXX) $(CXXFLAGS) -DUSLEEPWIN_EXPORTS -shared -o $(DLL) $(SRC) $(LIBS) -Wl,--out-implib,$(IMPLIB)
+$(RC_OBJ): $(RC_SRC) | $(BUILD)
+	$(WINDRES) -I include -i $(RC_SRC) -o $(RC_OBJ)
+
+$(DLL): $(SRC) include/usleep_win.h $(RC_OBJ) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DUSLEEPWIN_EXPORTS -shared -o $(DLL) $(SRC) $(RC_OBJ) $(LIBS) -Wl,--out-implib,$(IMPLIB)
 
 $(TEST_EXE): $(TEST_SRC) include/usleep_win.h $(DLL)
 	$(CXX) $(CXXFLAGS) -o $(TEST_EXE) $(TEST_SRC) -L$(BUILD) -lusleep_win $(LIBS)
