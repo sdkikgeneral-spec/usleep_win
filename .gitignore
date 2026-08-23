@@ -1,3 +1,22 @@
+# ---- ビルドディレクトリ ----
+build/
 build-*/
-bench*
 release_files/
+
+# ---- ビルド成果物 ----
+*.exe
+*.dll
+*.a
+*.lib
+*.exp
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# ---- ベンチマーク出力（ソースの tools/bench_usleep_csv.cpp は追跡対象） ----
+bench_*.csv
+bench_*.exe
+
+# Claude Code のローカル個人設定
+.claude/settings.local.json
