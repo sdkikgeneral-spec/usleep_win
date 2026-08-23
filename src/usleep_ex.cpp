@@ -22,6 +22,18 @@
 
 #include "../include/usleep_win.h"
 
+// ---- GetProcAddress の戻り値を関数ポインタ型へ変換する ----
+// GetProcAddress は FARPROC（実体は引数なし関数ポインタ）を返すため、目的の
+// シグネチャへ直接キャストすると GCC が -Wcast-function-type を出す。
+// 汎用関数ポインタ型 void(*)(void) を経由するキャストは GCC が
+// 「意図的な変換」として警告対象から除外すると明記しているため、それに倣う。
+// 変換そのものの意味は従来のキャストと同一（Win32 の標準的なイディオム）。
+template <typename Fn>
+static inline Fn cast_proc(FARPROC p)
+{
+	return reinterpret_cast<Fn>(reinterpret_cast<void (*)(void)>(p));
+}
+
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
@@ -55,10 +67,10 @@ static void resolve_ntdll_procs()
 	if (nt)
 	{
 		g_pNtSetTimerResolution.store(
-			(PFN_NtSetTimerResolution)GetProcAddress(nt, "NtSetTimerResolution"),
+			cast_proc<PFN_NtSetTimerResolution>(GetProcAddress(nt, "NtSetTimerResolution")),
 			std::memory_order_release);
 		g_pNtQueryTimerResolution.store(
-			(PFN_NtQueryTimerResolution)GetProcAddress(nt, "NtQueryTimerResolution"),
+			cast_proc<PFN_NtQueryTimerResolution>(GetProcAddress(nt, "NtQueryTimerResolution")),
 			std::memory_order_release);
 	}
 	g_ntdll_resolved.store(true, std::memory_order_release);
@@ -202,7 +214,7 @@ static bool probe_hrtimer_support()
 
 	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
 	PFN_CreateWaitableTimerExW p = k32
-		? reinterpret_cast<PFN_CreateWaitableTimerExW>(GetProcAddress(k32, "CreateWaitableTimerExW"))
+		? cast_proc<PFN_CreateWaitableTimerExW>(GetProcAddress(k32, "CreateWaitableTimerExW"))
 		: nullptr;
 
 	bool ok = false;
@@ -449,7 +461,7 @@ static PFN_SetThreadInformation get_SetThreadInformation()
 		if (k32)
 		{
 			g_pSetThreadInformation.store(
-				(PFN_SetThreadInformation)GetProcAddress(k32, "SetThreadInformation"),
+				cast_proc<PFN_SetThreadInformation>(GetProcAddress(k32, "SetThreadInformation")),
 				std::memory_order_release);
 		}
 		g_sti_resolved.store(true, std::memory_order_release);
