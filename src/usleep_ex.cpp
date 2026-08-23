@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+﻿// SPDX-License-Identifier: MIT
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -37,17 +37,47 @@ typedef LONG NTSTATUS;
 typedef NTSTATUS (NTAPI* PFN_NtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
 typedef NTSTATUS (NTAPI* PFN_NtQueryTimerResolution)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
 
+// ---- ntdll 関数ポインタの解決 ----
+// 関数ローカル static（C++11 magic static）は初回初期化で CRT の once ロックを取るため、
+// DllMain（ローダロック保持中）から到達しうる経路では絶対に使わない。
+// ここではプレーンなプロセスグローバル atomic に保持し、DllMain 経路は
+// 「解決済みなら使う／未解決なら何もしない」（peek_*）だけを行う。
+static std::atomic<PFN_NtSetTimerResolution>   g_pNtSetTimerResolution{nullptr};
+static std::atomic<PFN_NtQueryTimerResolution> g_pNtQueryTimerResolution{nullptr};
+static std::atomic<bool> g_ntdll_resolved{false};
+
+// 解決を試みる。DllMain からは呼ばないこと。
+// 複数スレッドが同時に入っても同じ値を書くだけなので同期プリミティブは不要。
+static void resolve_ntdll_procs()
+{
+	if (g_ntdll_resolved.load(std::memory_order_acquire)) return;
+	HMODULE nt = GetModuleHandleW(L"ntdll.dll"); // ロードはしない（既にマップ済みのモジュールを引くだけ）
+	if (nt)
+	{
+		g_pNtSetTimerResolution.store(
+			(PFN_NtSetTimerResolution)GetProcAddress(nt, "NtSetTimerResolution"),
+			std::memory_order_release);
+		g_pNtQueryTimerResolution.store(
+			(PFN_NtQueryTimerResolution)GetProcAddress(nt, "NtQueryTimerResolution"),
+			std::memory_order_release);
+	}
+	g_ntdll_resolved.store(true, std::memory_order_release);
+}
+
 static PFN_NtSetTimerResolution get_NtSetTimerResolution()
 {
-	static auto fn = (PFN_NtSetTimerResolution)GetProcAddress(
-		GetModuleHandleW(L"ntdll.dll"), "NtSetTimerResolution");
-	return fn;
+	resolve_ntdll_procs();
+	return g_pNtSetTimerResolution.load(std::memory_order_acquire);
 }
 static PFN_NtQueryTimerResolution get_NtQueryTimerResolution()
 {
-	static auto fn = (PFN_NtQueryTimerResolution)GetProcAddress(
-		GetModuleHandleW(L"ntdll.dll"), "NtQueryTimerResolution");
-	return fn;
+	resolve_ntdll_procs();
+	return g_pNtQueryTimerResolution.load(std::memory_order_acquire);
+}
+// DllMain 経路専用: 解決済みのポインタを読むだけ。GetProcAddress も行わない。
+static PFN_NtSetTimerResolution peek_NtSetTimerResolution()
+{
+	return g_pNtSetTimerResolution.load(std::memory_order_acquire);
 }
 
 #ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
@@ -62,8 +92,13 @@ typedef struct _THREAD_POWER_THROTTLING_STATE
 #ifndef THREAD_POWER_THROTTLING_EXECUTION_SPEED
 #define THREAD_POWER_THROTTLING_EXECUTION_SPEED 0x1
 #endif
+// THREAD_INFORMATION_CLASS の ThreadPowerThrottling は列挙値 3
+// （ThreadMemoryPriority=0, ThreadAbsoluteCpuPriority=1, ThreadDynamicCodePolicy=2）。
+// 列挙子はマクロではないので #ifndef では検出できず、古い SDK 用のフォールバック定義が
+// 常に有効になる。ここが 11 だと SetThreadInformation が ERROR_INVALID_PARAMETER(87) で
+// 失敗し、usleep_set_power_mode() が常に -1 を返していた。
 #ifndef ThreadPowerThrottling
-#define ThreadPowerThrottling (THREAD_INFORMATION_CLASS)11
+#define ThreadPowerThrottling (THREAD_INFORMATION_CLASS)3
 #endif
 
 #ifndef YieldProcessor
@@ -116,15 +151,25 @@ static constexpr ProfileThresholds kProfileThresholds[] = {
 	/* LOW_POWER */ { 1000,   0 },
 };
 
-static inline LARGE_INTEGER qpc_freq()
+// QPC 周波数はブート中不変なので、競合して二重に取得しても同じ値になる。
+// magic static を避けるためプレーンな atomic キャッシュにする。
+static std::atomic<uint64_t> g_qpc_freq{0};
+static inline uint64_t qpc_freq_hz()
 {
-	static LARGE_INTEGER f = []{ LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
+	uint64_t f = g_qpc_freq.load(std::memory_order_relaxed);
+	if (f == 0)
+	{
+		LARGE_INTEGER x;
+		if (!QueryPerformanceFrequency(&x)) return 0;
+		f = (uint64_t)x.QuadPart;
+		g_qpc_freq.store(f, std::memory_order_relaxed);
+	}
 	return f;
 }
 static inline uint64_t qpc_now_us()
 {
 	LARGE_INTEGER now; QueryPerformanceCounter(&now);
-	const auto f = (uint64_t)qpc_freq().QuadPart;
+	const uint64_t f = qpc_freq_hz();
 	if (f == 0) return 0;
 	const uint64_t ticks = (uint64_t)now.QuadPart;
 	const uint64_t q = ticks / f;
@@ -141,30 +186,62 @@ static inline LONGLONG us_to_100ns(uint64_t us) {
 	return -(LONGLONG)(us * k);
 }
 
+// ---- 高分解能 WaitableTimer の可用性判定（プロセス全体で一度だけ） ----
+// 旧実装は get_timer_handle() が呼ばれるまで g_has_hrtimer が false のままで、
+// 「まだ長い待機をしていないスレッド」では HR タイマ経路に入れなかった。
+// ここでは可用性をプロセス全体で一度だけ確定させ、スレッドのウォームアップに依存させない。
+using PFN_CreateWaitableTimerExW = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+static std::atomic<PFN_CreateWaitableTimerExW> g_pCreateWaitableTimerExW{nullptr};
+static std::atomic<bool> g_hrtimer_probed{false};
+
+// 競合した場合は複数スレッドが同じ判定を行うだけ（結果は同一）なのでロックは不要。
+static bool probe_hrtimer_support()
+{
+	if (g_hrtimer_probed.load(std::memory_order_acquire))
+		return g_has_hrtimer.load(std::memory_order_acquire);
+
+	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+	PFN_CreateWaitableTimerExW p = k32
+		? reinterpret_cast<PFN_CreateWaitableTimerExW>(GetProcAddress(k32, "CreateWaitableTimerExW"))
+		: nullptr;
+
+	bool ok = false;
+	if (p)
+	{
+		HANDLE h = p(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+		if (h)
+		{
+			ok = true;
+			// 試作したハンドルは捨てずにこのスレッドのタイマとして使い回す
+			if (!t_timer) t_timer = h;
+			else CloseHandle(h);
+		}
+	}
+
+	g_pCreateWaitableTimerExW.store(p, std::memory_order_release);
+	g_has_hrtimer.store(ok, std::memory_order_release);
+	g_hrtimer_probed.store(true, std::memory_order_release);
+	return ok;
+}
+
 static HANDLE get_timer_handle()
 {
 	if (t_timer) return t_timer;
-	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-	if (k32)
+	if (probe_hrtimer_support())
 	{
-		using PFN_CreateWaitableTimerExW = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
-		auto p = reinterpret_cast<PFN_CreateWaitableTimerExW>(GetProcAddress(k32, "CreateWaitableTimerExW"));
+		// probe がこのスレッドのハンドルを確保している場合がある
+		if (t_timer) return t_timer;
+		auto p = g_pCreateWaitableTimerExW.load(std::memory_order_acquire);
 		if (p)
 		{
 			HANDLE h = p(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-			if (h)
-			{
-				g_has_hrtimer.store(true);
-				return (t_timer = h);
-			}
+			if (h) return (t_timer = h);
 		}
 	}
+	// HR 不可、または HR ハンドル作成に失敗した場合は通常のタイマで代替する。
+	// ここでプロセス全体の g_has_hrtimer を書き換えてはならない（スコープが違う）。
 	HANDLE h = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-	if (h)
-	{
-		g_has_hrtimer.store(false);
-		t_timer = h;
-	}
+	if (h) t_timer = h;
 	return t_timer;
 }
 
@@ -225,7 +302,8 @@ static void do_sleep_us(uint64_t usec)
 
 	const uint64_t now_us = qpc_now_us();
 	const uint64_t target_us = (usec > (UINT64_MAX - now_us)) ? UINT64_MAX : (now_us + usec);
-	bool can_hr = g_has_hrtimer.load();
+	// HR タイマ可用性はプロセス単位で確定済み（未確定ならここで確定させる）。
+	const bool can_hr = probe_hrtimer_support();
 
 	if (usec >= timer_first_us || (can_hr && usec > prefer_spin_below))
 	{
@@ -274,29 +352,29 @@ static void do_sleep_us(uint64_t usec)
 
 extern "C" {
 
-USLEEP_API void usleep_win(uint64_t usec)
+USLEEP_API void USLEEP_CALL usleep_win(uint64_t usec)
 {
 	do_sleep_us(usec);
 }
 
-USLEEP_API void nsleep_win(uint64_t nsec)
+USLEEP_API void USLEEP_CALL nsleep_win(uint64_t nsec)
 {
 	do_sleep_us(nsec / 1000ULL);
 }
 
-USLEEP_API uint64_t usleep_now_steady_us()
+USLEEP_API uint64_t USLEEP_CALL usleep_now_steady_us()
 {
 	return qpc_now_us();
 }
 
-USLEEP_API void usleep_until_steady_us(uint64_t target_us)
+USLEEP_API void USLEEP_CALL usleep_until_steady_us(uint64_t target_us)
 {
 	uint64_t now = qpc_now_us();
 	if (target_us <= now) return;
 	do_sleep_us(target_us - now);
 }
 
-USLEEP_API int usleep_init_timer_resolution(unsigned int ms)
+USLEEP_API int USLEEP_CALL usleep_init_timer_resolution(unsigned int ms)
 {
 	if (ms == 0)
 	{
@@ -320,12 +398,12 @@ static void shutdown_timer_resolution_impl()
 	if (prev) timeEndPeriod(prev);
 }
 
-USLEEP_API void usleep_shutdown_timer_resolution()
+USLEEP_API void USLEEP_CALL usleep_shutdown_timer_resolution()
 {
 	shutdown_timer_resolution_impl();
 }
 
-USLEEP_API int usleep_set_profile(int profile)
+USLEEP_API int USLEEP_CALL usleep_set_profile(int profile)
 {
 	if (profile < USLP_BALANCED || profile > USLP_LOW_POWER) return -1;
 	t_cfg.profile = (UsleepProfile)profile;
@@ -347,13 +425,13 @@ USLEEP_API int usleep_set_profile(int profile)
 	return 0;
 }
 
-USLEEP_API int usleep_set_spin_last_us(unsigned int us)
+USLEEP_API int USLEEP_CALL usleep_set_spin_last_us(unsigned int us)
 {
 	t_cfg.spin_last_us = us;
 	return 0;
 }
 
-USLEEP_API int usleep_set_yield_policy(int policy)
+USLEEP_API int USLEEP_CALL usleep_set_yield_policy(int policy)
 {
 	if (policy < USLP_YIELD_NONE || policy > USLP_YIELD_SLEEP1) return -1;
 	t_cfg.yield_policy = (UsleepYieldPolicy)policy;
@@ -361,14 +439,25 @@ USLEEP_API int usleep_set_yield_policy(int policy)
 }
 
 using PFN_SetThreadInformation = BOOL (WINAPI*)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+static std::atomic<PFN_SetThreadInformation> g_pSetThreadInformation{nullptr};
+static std::atomic<bool> g_sti_resolved{false};
 static PFN_SetThreadInformation get_SetThreadInformation()
 {
-	static auto fn = (PFN_SetThreadInformation)GetProcAddress(
-		GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
-	return fn;
+	if (!g_sti_resolved.load(std::memory_order_acquire))
+	{
+		HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+		if (k32)
+		{
+			g_pSetThreadInformation.store(
+				(PFN_SetThreadInformation)GetProcAddress(k32, "SetThreadInformation"),
+				std::memory_order_release);
+		}
+		g_sti_resolved.store(true, std::memory_order_release);
+	}
+	return g_pSetThreadInformation.load(std::memory_order_acquire);
 }
 
-USLEEP_API int usleep_set_power_mode(int mode)
+USLEEP_API int USLEEP_CALL usleep_set_power_mode(int mode)
 {
 	if (mode < USLP_POWER_DEFAULT || mode > USLP_POWER_ECO) return -1;
 
@@ -403,7 +492,7 @@ USLEEP_API int usleep_set_power_mode(int mode)
 	return ok ? 0 : -1;
 }
 
-USLEEP_API int usleep_query_nt_resolution(unsigned int* min_100ns, unsigned int* max_100ns, unsigned int* cur_100ns)
+USLEEP_API int USLEEP_CALL usleep_query_nt_resolution(unsigned int* min_100ns, unsigned int* max_100ns, unsigned int* cur_100ns)
 {
 	auto fn = get_NtQueryTimerResolution();
 	if (!fn) return -1;
@@ -416,7 +505,7 @@ USLEEP_API int usleep_query_nt_resolution(unsigned int* min_100ns, unsigned int*
 	return 0;
 }
 
-USLEEP_API int usleep_init_nt_resolution(unsigned int hundreds_ns)
+USLEEP_API int USLEEP_CALL usleep_init_nt_resolution(unsigned int hundreds_ns)
 {
 	auto fn = get_NtSetTimerResolution();
 	if (!fn) return -1;
@@ -446,11 +535,14 @@ USLEEP_API int usleep_init_nt_resolution(unsigned int hundreds_ns)
 	return 0;
 }
 
-static void shutdown_nt_resolution_impl()
+// allow_resolve=false のときは GetProcAddress を含む解決処理を一切行わない（DllMain 経路）。
+// g_nt_resolution_100ns が非 0 ということは usleep_init_nt_resolution() が成功済み＝
+// ポインタは既に解決されているので、DllMain 経路でも peek で必ず取得できる。
+static void shutdown_nt_resolution_impl(bool allow_resolve)
 {
 	unsigned prev = g_nt_resolution_100ns.exchange(0);
 	if (!prev) return;
-	auto fn = get_NtSetTimerResolution();
+	auto fn = allow_resolve ? get_NtSetTimerResolution() : peek_NtSetTimerResolution();
 	if (fn)
 	{
 		ULONG cur = 0;
@@ -458,12 +550,12 @@ static void shutdown_nt_resolution_impl()
 	}
 }
 
-USLEEP_API void usleep_shutdown_nt_resolution(void)
+USLEEP_API void USLEEP_CALL usleep_shutdown_nt_resolution(void)
 {
-	shutdown_nt_resolution_impl();
+	shutdown_nt_resolution_impl(true);
 }
 
-USLEEP_API void usleep_get_stats(usleep_stats_t* out)
+USLEEP_API void USLEEP_CALL usleep_get_stats(usleep_stats_t* out)
 {
 	if (!out) return;
 	out->spin_relax 		 = t_stat_spin_relax;
@@ -473,13 +565,26 @@ USLEEP_API void usleep_get_stats(usleep_stats_t* out)
 	out->waitable_timer_uses = t_stat_timer_uses;
 }
 
-USLEEP_API void usleep_reset_stats(void)
+USLEEP_API void USLEEP_CALL usleep_reset_stats(void)
 {
 	t_stat_spin_relax	= 0;
 	t_stat_yield_switch = 0;
 	t_stat_yield_sleep0 = 0;
 	t_stat_yield_sleep1 = 0;
 	t_stat_timer_uses	= 0;
+}
+
+// ---- バージョン照会 ----
+// ヘッダのマクロをそのまま返す。DLL を差し替えた利用者が、
+// コンパイル時に見ていたヘッダと実際にロードされた DLL の版を照合できる。
+USLEEP_API uint32_t USLEEP_CALL usleep_win_version(void)
+{
+	return (uint32_t)USLEEP_WIN_VERSION_NUM;
+}
+
+USLEEP_API const char* USLEEP_CALL usleep_win_version_string(void)
+{
+	return USLEEP_WIN_VERSION_STRING;
 }
 
 } // extern "C"
@@ -496,8 +601,12 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
 
 		if (reason == DLL_PROCESS_DETACH)
 		{
+			// ここはローダロック保持中。magic static の初回初期化・ヒープ確保・
+			// 他 DLL のロード・同期プリミティブでの待機を発生させてはならない。
+			// timeEndPeriod / NtSetTimerResolution はシステム全体のタイマ分解能を
+			// 戻すため、プロセス終了時でも OS 任せにできず呼ぶ必要がある。
 			shutdown_timer_resolution_impl();
-			shutdown_nt_resolution_impl();
+			shutdown_nt_resolution_impl(false);
 		}
 	}
 	return TRUE;
