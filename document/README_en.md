@@ -529,6 +529,9 @@ This repository is licensed under the MIT License. See [LICENSE](../LICENSE) for
 ## 🤝 Contributing
 Issues and PRs are welcome—tuning ideas, improvements, and measurement reports are highly appreciated.
 
+Ideas currently under consideration are collected in the **[roadmap (roadmap.md)](./roadmap.md)**
+(**nothing there is implemented yet, and every figure is an estimate**).
+
 ### Source encoding
 Save sources under `src/`, `include/`, `tests/`, and `tools/` as **UTF-8 with BOM**.
 
