@@ -1,5 +1,13 @@
 {
-    "C_Cpp.default.compileCommands": "d:\\Develop\\Projects\\usleep_win\\builddir/compile_commands.json",
-    "C_Cpp.default.configurationProvider": "mesonbuild.mesonbuild",
-    "makefile.configureOnOpen": true
+	// マシン依存の絶対パスを書かないこと。${workspaceFolder} で解決する。
+	// compile_commands.json は meson setup build で生成される。
+	"C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+	"C_Cpp.default.configurationProvider": "mesonbuild.mesonbuild",
+	"mesonbuild.buildFolder": "${workspaceFolder}/build",
+	"makefile.configureOnOpen": true,
+	// コードスタイル: インデントはタブ、ソースは UTF-8
+	"files.encoding": "utf8",
+	"editor.insertSpaces": false,
+	"editor.detectIndentation": false,
+	"files.eol": "\n"
 }

@@ -23,8 +23,8 @@
 //============================================================
 #define USLEEP_WIN_VERSION_MAJOR	0
 #define USLEEP_WIN_VERSION_MINOR	2
-#define USLEEP_WIN_VERSION_PATCH	1
-#define USLEEP_WIN_VERSION_STRING	"0.2.1"
+#define USLEEP_WIN_VERSION_PATCH	2
+#define USLEEP_WIN_VERSION_STRING	"0.2.2"
 
 // 上位8bit=major / 中位8bit=minor / 下位8bit=patch にパックした比較用の値
 #define USLEEP_WIN_VERSION_NUM \
@@ -136,7 +136,15 @@ USLEEP_API void USLEEP_CALL usleep_shutdown_nt_resolution(void);
 // 注意: usleep_set_profile() は spin_last_us と yield_policy を上書きする。
 //		 個別に詰めたい場合は必ず set_profile() → set_spin_last_us() /
 //		 set_yield_policy() の順で呼ぶこと。逆順では設定が消える。
+//
+// spin_last_us の上限。末尾スピンは 1 コアを 100% 占有する区間なので上限を設ける。
+// 10ms は Windows 既定のタイマ分解能(約15.6ms)と既定クォンタム(クライアントで
+// 約20〜30ms)のどちらより短く、「タイマの粗さを末尾スピンで隠す」という設計目的の
+// 範囲に収まる最大値として選んだ。実用上の推奨は 250〜500µs。
+#define USLEEP_SPIN_LAST_US_MAX 10000u
+
 USLEEP_API int	USLEEP_CALL usleep_set_profile(int profile);
+// us > USLEEP_SPIN_LAST_US_MAX のときは -1 を返し、設定を変更しない。
 USLEEP_API int	USLEEP_CALL usleep_set_spin_last_us(unsigned int us);
 USLEEP_API int	USLEEP_CALL usleep_set_yield_policy(int policy);
 USLEEP_API int	USLEEP_CALL usleep_set_power_mode(int mode);

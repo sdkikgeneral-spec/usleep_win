@@ -1,0 +1,211 @@
+# usleep_win CI
+#
+# CLAUDE.md の「MSVC・MinGW の両方が通ることを変更のたびに確認する」を自動化する。
+# 3 構成をマトリクスで回す:
+#   1. MSVC   + Meson
+#   2. MinGW  + Meson
+#   3. MinGW  + 手書き Makefile
+#
+# ---- タイミングテストと CI について ----
+# tests/test_usleep.cpp は実時間の待機を測り、下限（早期 return の検出）と
+# p95 の上限を検証する。GitHub Actions の windows-latest は仮想化された
+# 共有ホストなのでジッタが大きく、上限側のアサートがフレークしうる。
+#
+# そこでテスト側に CI モードを実装してある。環境変数 USLEEP_TEST_CI=1 を渡すと
+# tests/test_usleep.cpp は **上限側のアサートの許容量だけ** を広げる。
+#   - 下限側（要求待機時間を満たしているか＝早期 return の検出）は緩めない。
+#     ここを緩めると実装が即 return してもテストが通る空振りになる。
+#   - 統計カウンタによる待機経路の証明（等値・下限）も緩めない。
+#     これは時間ではなく実装の分岐を見ているので、ホストのジッタとは無関係。
+#   - CPU 会計の回帰テスト（純ビジー待機が論理コア 1 個の 100% 付近を返すこと）も
+#     緩めない。計器の正しさの検証であり、共有ホストでも数十 % 単位では動かない。
+# ローカルでは環境変数を設定しないこと。既定は本番の精度要件のままである。
+# ワークフロー側で continue-on-error にして失敗を握り潰すのは禁止。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一ブランチで新しい push があったら古い実行は打ち切る
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # 1. MSVC + Meson
+  # ============================================================
+  msvc-meson:
+    name: MSVC / Meson (native=${{ matrix.native }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        native: [false, true]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Meson and Ninja
+        run: python -m pip install --upgrade meson ninja
+
+      # cl.exe を PATH に載せる（x64 Native Tools 相当の環境変数を設定する）
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # werror: true はローカル検証で MSVC /W4 の警告がゼロであることを
+      # 確認したうえで有効化している。新しい警告が入ったら CI で落とす。
+      - name: Configure
+        run: >
+          meson setup build --buildtype=release
+          -Dwerror=true
+          -Dnative=${{ matrix.native }}
+          --prefix "${{ github.workspace }}/stage"
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        env:
+          USLEEP_TEST_CI: '1'   # 上限側のアサートのみ緩和。下限は本番のまま
+        run: meson test -C build --print-errorlogs
+
+      - name: Install (配布物の生成を検証)
+        run: meson install -C build
+
+      - name: Show installed layout
+        run: Get-ChildItem -Recurse "${{ github.workspace }}/stage" | Select-Object FullName
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msvc-meson-logs-native-${{ matrix.native }}
+          path: build/meson-logs/
+          if-no-files-found: ignore
+
+  # ============================================================
+  # 2. MinGW + Meson
+  # ============================================================
+  mingw-meson:
+    name: MinGW / Meson (native=${{ matrix.native }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        native: [false, true]
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+
+      # werror: true はローカル検証で g++ の
+      # -Wall -Wextra -Wpedantic 警告がゼロであることを確認済み。
+      - name: Configure
+        run: >
+          meson setup build --buildtype=release
+          -Dwerror=true
+          -Dnative=${{ matrix.native }}
+          --prefix "$PWD/stage"
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        env:
+          USLEEP_TEST_CI: '1'   # 上限側のアサートのみ緩和。下限は本番のまま
+        run: meson test -C build --print-errorlogs
+
+      - name: Install (配布物の生成を検証)
+        run: meson install -C build
+
+      - name: Show installed layout
+        run: find stage -type f
+
+      # pkg-config 経由で本当に使える .pc になっているかを実際に問い合わせる
+      - name: Verify pkg-config files
+        run: |
+          export PKG_CONFIG_PATH="$PWD/stage/lib/pkgconfig:$PKG_CONFIG_PATH"
+          pkgconf --exists usleep_win
+          pkgconf --exists usleep_win-static
+          echo "shared cflags: $(pkgconf --cflags usleep_win)"
+          echo "shared libs  : $(pkgconf --libs usleep_win)"
+          echo "static cflags: $(pkgconf --cflags usleep_win-static)"
+          echo "static libs  : $(pkgconf --libs --static usleep_win-static)"
+          pkgconf --cflags usleep_win-static | grep -q -- -DUSLEEPWIN_STATIC
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mingw-meson-logs-native-${{ matrix.native }}
+          path: build/meson-logs/
+          if-no-files-found: ignore
+
+  # ============================================================
+  # 3. MinGW + 手書き Makefile
+  # ============================================================
+  mingw-make:
+    name: MinGW / Makefile
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-pkgconf
+
+      # Makefile の CXXFLAGS は ?= なので、環境変数で丸ごと上書きされる。
+      # meson 側の warning_level=3 相当をそのまま維持したうえで -Werror を足す。
+      - name: Build
+        run: >-
+          mingw32-make
+          CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude"
+
+      - name: Test (shared + static)
+        env:
+          USLEEP_TEST_CI: '1'   # 上限側のアサートのみ緩和。下限は本番のまま
+        run: >-
+          mingw32-make test
+          CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude"
+
+      - name: Install (配布物の生成を検証)
+        run: mingw32-make install PREFIX="$PWD/stage"
+
+      - name: Show installed layout
+        run: find stage -type f
+
+      # Meson ビルドと同じ成果物名が出ているかを突き合わせる。
+      # ここが崩れると「Makefile では動くが Meson では動かない」が発生する。
+      - name: Verify artifact parity with Meson
+        run: |
+          test -f stage/bin/usleep_win.dll
+          test -f stage/lib/libusleep_win_static.a
+          test -f stage/include/usleep_win.h
+          test -f stage/lib/pkgconfig/usleep_win.pc
+          test -f stage/lib/pkgconfig/usleep_win-static.pc

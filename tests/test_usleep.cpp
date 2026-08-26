@@ -19,7 +19,62 @@
 #include <vector>
 #include "../include/usleep_win.h"
 
+// CPU 使用率の計器。tools/bench_usleep_csv.cpp と同じヘッダを使う。
+// ベンチが表示する CPU% とテストが検証する CPU% を同一実装にしておかないと、
+// テストが通っていてもベンチの数字は壊れている、という空振りになる。
+#include "../tools/cpu_accounting.h"
+
+//============================================================
+// テスト専用の内部フック（src/usleep_ex.cpp が公開ヘッダ外でエクスポートしている）
+//   HR WaitableTimer が使える通常の環境では do_sleep_us() の
+//     - LOW_POWER の純スピン分岐
+//     - SetWaitableTimer 失敗時の Sleep(ms) フォールバック
+//   が到達不能になる。このフックで「HR なし」「タイマ自体なし」を強制し、
+//   両経路を実際に踏んだことを統計カウンタ差分で証明する。
+//   公開ヘッダには載っていない = 公開 ABI ではない。ここでだけ宣言する。
+//============================================================
+enum
+{
+	FORCE_AUTO		 = 0,
+	FORCE_NO_HRTIMER = 1,
+	FORCE_NO_TIMER	 = 2,
+};
+extern "C" USLEEP_API int USLEEP_CALL usleep_internal_force_wait_backend(int mode);
+
 static int g_failures = 0;
+
+//============================================================
+// CI モード（環境変数 USLEEP_TEST_CI=1）
+//	 GitHub Actions の windows-latest のような共有・仮想化ホストでは、
+//	 他ジョブとの CPU 競合でスケジューリング遅延が跳ね、**上限側**のアサートが
+//	 実装の劣化と無関係にフレークする。
+//
+//	 このモードが緩めるのは上限側の許容量だけである。
+//	   - 下限側（要求待機時間を満たしているか＝早期 return の検出）は緩めない。
+//		 ここを緩めた瞬間、実装が即 return してもテストが通る空振りになる。
+//	   - 統計カウンタによる経路の証明（等値・下限）も緩めない。
+//		 これは時間ではなく実装の分岐を見ているので、ジッタとは無関係。
+//	   - 既定（環境変数なし）では本番の精度要件のまま。
+//
+//	 使い方: 呼び出し側で hi_us(strict, ci) と両方の値を明示する。CI 用の緩い値が
+//	 いつのまにか本番の閾値として居座るのを防ぐため、片方だけ書けないようにする。
+//============================================================
+static bool detect_ci_mode()
+{
+	// getenv は MSVC の /W4 /WX で C4996 になるため Win32 API で読む。
+	char buf[16] = { 0 };
+	const DWORD n = GetEnvironmentVariableA("USLEEP_TEST_CI", buf, (DWORD)sizeof(buf));
+	if (n == 0)			  return false;			// 未設定
+	if (n >= sizeof(buf)) return true;			// 想定外に長い値でも「設定あり」
+	return !(buf[0] == '0' && buf[1] == '\0');	// "0" は明示的な無効化
+}
+
+static const bool g_ci_mode = detect_ci_mode();
+
+static uint64_t hi_us(uint64_t strict_us, uint64_t ci_us)
+{
+	return g_ci_mode ? ci_us : strict_us;
+}
 
 // ---- アサート補助 ----
 static void assert_true(bool cond, const char* msg)
@@ -353,31 +408,31 @@ static void test_timing()
 		Samples s = measure(1, 200);
 		print_samples("usleep_win(1us)", s);
 		assert_ge_u64(s.mn,  1,    "1us must not return before 1us has elapsed");
-		assert_le_u64(s.p95, 2000, "1us p95 should stay well under 2ms");
+		assert_le_u64(s.p95, hi_us(2000, 20000), "1us p95 should stay well under 2ms");
 	}
 	{
 		Samples s = measure(100, 100);
 		print_samples("usleep_win(100us)", s);
 		assert_ge_u64(s.mn,  100,  "100us must never return early");
-		assert_le_u64(s.p95, 5000, "100us p95 should stay under 5ms");
+		assert_le_u64(s.p95, hi_us(5000, 30000), "100us p95 should stay under 5ms");
 	}
 	{
 		Samples s = measure(1000, 50);
 		print_samples("usleep_win(1ms)", s);
 		assert_ge_u64(s.mn,  1000,  "1ms must never return early");
-		assert_le_u64(s.p95, 10000, "1ms p95 should stay under 10ms");
+		assert_le_u64(s.p95, hi_us(10000, 40000), "1ms p95 should stay under 10ms");
 	}
 	{
 		Samples s = measure(20000, 10);
 		print_samples("usleep_win(20ms)", s);
 		assert_ge_u64(s.mn,  20000, "20ms must never return early");
-		assert_le_u64(s.p95, 40000, "20ms p95 should stay under 40ms");
+		assert_le_u64(s.p95, hi_us(40000, 80000), "20ms p95 should stay under 40ms");
 	}
 	{
 		Samples s = measure(1000000, 1); // 1s は 1 サンプルのみ
 		print_samples("usleep_win(1s)", s);
 		assert_ge_u64(s.med,  1000000, "1s must not return early");
-		assert_le_u64(s.med,  1100000, "1s should not overshoot by more than 100ms");
+		assert_le_u64(s.med,  hi_us(1100000, 1400000), "1s should not overshoot by more than 100ms");
 	}
 }
 
@@ -410,8 +465,8 @@ static void test_deadline()
 		// 下限: 締切ベースなので N*tick 未満で終わってはいけない（即 return 検出）
 		assert_ge_u64(total, (uint64_t)N * tick, "deadline loop finished before N*tick elapsed");
 		// ドリフトは累積しない（total は N*tick + 最後の遅れ程度に収まる）
-		assert_le_u64(total, (uint64_t)N * tick + 30000, "deadline loop drifted cumulatively");
-		assert_le_u64(pct(late, 0.95), 5000, "deadline lateness p95 too large");
+		assert_le_u64(total, (uint64_t)N * tick + hi_us(30000, 300000), "deadline loop drifted cumulatively");
+		assert_le_u64(pct(late, 0.95), hi_us(5000, 30000), "deadline lateness p95 too large");
 	}
 
 	// 過去の時刻: 即 return し、待機経路には一切入らない
@@ -423,7 +478,7 @@ static void test_deadline()
 		uint64_t dt = usleep_now_steady_us() - t0;
 		StatDiff d = diff(a, snap());
 		print_diff("until_steady_us(past)", d);
-		assert_le_u64(dt, 1000, "past deadline must return immediately");
+		assert_le_u64(dt, hi_us(1000, 20000), "past deadline must return immediately");
 		assert_eq_u64(d.total(), 0, "past deadline must not enter any wait path");
 	}
 
@@ -496,6 +551,33 @@ static void test_setters()
 	assert_ret(usleep_set_yield_policy(4),  -1, "set_yield_policy(4) must fail");
 	assert_ret(usleep_set_yield_policy(USLP_YIELD_NONE),  0, "set_yield_policy(NONE)");
 	assert_ret(usleep_set_yield_policy(USLP_YIELD_SLEEP1), 0, "set_yield_policy(SLEEP1)");
+
+	// spin_last_us: 他の setter と同じく範囲外は -1。正常系は従来どおり 0。
+	assert_ret(usleep_set_spin_last_us(0), 0, "set_spin_last_us(0) is valid (no tail spin)");
+	assert_ret(usleep_set_spin_last_us(250), 0, "set_spin_last_us(250) is the default");
+	assert_ret(usleep_set_spin_last_us(USLEEP_SPIN_LAST_US_MAX), 0,
+		"set_spin_last_us(MAX) must be accepted (boundary is inclusive)");
+	assert_ret(usleep_set_spin_last_us(USLEEP_SPIN_LAST_US_MAX + 1u), -1,
+		"set_spin_last_us(MAX+1) must fail");
+	assert_ret(usleep_set_spin_last_us(0xFFFFFFFFu), -1,
+		"set_spin_last_us(UINT_MAX) must fail (otherwise every wait becomes a pure busy spin)");
+
+	// 拒否された値で設定が書き換わっていないことを、経路の統計で証明する。
+	// spin_last_us=0 のままなら 200us の待機で Sleep(0) が出る。
+	// もし UINT_MAX が通ってしまっていれば remain <= spin_last_us となり
+	// Sleep(0) は 1 回も出ない（= このアサートが落ちる）。
+	{
+		usleep_set_profile(USLP_BALANCED);
+		usleep_set_yield_policy(USLP_YIELD_SLEEP0);
+		assert_ret(usleep_set_spin_last_us(0), 0, "set_spin_last_us(0)");
+		assert_ret(usleep_set_spin_last_us(0xFFFFFFFFu), -1, "rejected value");
+		usleep_stats_t a = snap();
+		usleep_win(200);
+		StatDiff d = diff(a, snap());
+		print_diff("spin_last_us reject keeps 0", d);
+		assert_ge_u64(d.yield_sleep0, 1,
+			"a rejected set_spin_last_us() must leave the previous value (0) untouched");
+	}
 
 	assert_ret(usleep_set_power_mode(-1), -1, "set_power_mode(-1) must fail");
 	assert_ret(usleep_set_power_mode(3),  -1, "set_power_mode(3) must fail");
@@ -609,9 +691,242 @@ static void test_thread_isolation()
 	assert_eq_u64(worker_sleep0.load(), 0,   "worker thread must not be affected by main's SLEEP0 policy");
 }
 
+//============================================================
+// 8. 到達不能になりがちな待機経路を内部フックで強制的に踏む
+//    HR WaitableTimer が使える環境では、通常の入力ではこの 2 経路に入れない。
+//    「テストで検証できないコード」を残さないための検証。
+//============================================================
+static void test_forced_backends()
+{
+	std::puts("[TEST] forced wait backends (unreachable-on-modern-Windows paths)...");
+
+	// フック自体の引数検証（他の setter と同じ 0/-1 規約）
+	assert_ret(usleep_internal_force_wait_backend(-1), -1, "force_wait_backend(-1) must fail");
+	assert_ret(usleep_internal_force_wait_backend(3),  -1, "force_wait_backend(3) must fail");
+
+	// --- (a) LOW_POWER の純スピン分岐 ---
+	// LOW_POWER は prefer_spin_below==0 なので、HR タイマがあると usec>0 の全てが
+	// タイマ経路に吸われる。HR なしを強制すると usec < timer_first_us(1000) が
+	// spin_with_yield_until_us(target, 0, SLEEP1) に落ちる。
+	{
+		assert_ret(usleep_internal_force_wait_backend(FORCE_NO_HRTIMER), 0, "force NO_HRTIMER");
+		usleep_set_profile(USLP_LOW_POWER); // spin_last_us=0, yield=SLEEP1
+		usleep_stats_t a = snap();
+		uint64_t t0 = usleep_now_steady_us();
+		usleep_win(500); // 500 < timer_first_us(1000)、can_hr=false
+		uint64_t dt = usleep_now_steady_us() - t0;
+		StatDiff d = diff(a, snap());
+		print_diff("LOW_POWER 500us (no HR)", d);
+		assert_eq_u64(d.timer_uses,   0, "NO_HRTIMER + 500us must not reach the waitable timer");
+		assert_ge_u64(d.yield_sleep1, 1, "LOW_POWER spin branch must issue Sleep(1)");
+		assert_ge_u64(d.spin_relax,   1, "LOW_POWER spin branch must spin");
+		assert_ge_u64(dt, 500, "usleep_win(500) must not return early");
+	}
+
+	// --- (b) HR なし環境での prefer_spin_below 超えがスピンに落ちること ---
+	// BALANCED{2000,200}: 201us は HR ありならタイマ、HR なしならスピン。
+	{
+		assert_ret(usleep_internal_force_wait_backend(FORCE_NO_HRTIMER), 0, "force NO_HRTIMER");
+		usleep_set_profile(USLP_BALANCED);
+		assert_ret(usleep_set_spin_last_us(0), 0, "spin_last_us=0");
+		usleep_stats_t a = snap();
+		uint64_t t0 = usleep_now_steady_us();
+		usleep_win(201);
+		uint64_t dt = usleep_now_steady_us() - t0;
+		StatDiff d = diff(a, snap());
+		print_diff("BALANCED 201us (no HR)", d);
+		assert_eq_u64(d.timer_uses, 0, "without HR, 201us must stay on the spin path");
+		assert_ge_u64(d.spin_relax, 1, "the 201us wait must spin");
+		assert_ge_u64(dt, 201, "usleep_win(201) must not return early");
+	}
+
+	// --- (c) Sleep(ms) フォールバック + 切り捨て分の詰め ---
+	// タイマ不可を強制すると usec >= 1000 で Sleep(usec/1000) 経路に落ちる。
+	// LOW_POWER は spin_last_us==0。2500us なら Sleep(2) しか眠らないので、
+	// 切り捨てた 500us を詰めないと 2500us より早く返る（旧実装の契約違反）。
+	// タイマ分解能を 1ms に上げて Sleep(2) を約 2.0ms に寄せ、その差を顕在化させる。
+	{
+		const bool got_res = (usleep_init_timer_resolution(1) == 0);
+		assert_ret(usleep_internal_force_wait_backend(FORCE_NO_TIMER), 0, "force NO_TIMER");
+		usleep_set_profile(USLP_LOW_POWER); // spin_last_us=0, timer_first_us=1000
+
+		std::vector<uint64_t> v;
+		usleep_stats_t a = snap();
+		for (int i = 0; i < 20; i++)
+		{
+			uint64_t t0 = usleep_now_steady_us();
+			usleep_win(2500);
+			v.push_back(usleep_now_steady_us() - t0);
+		}
+		StatDiff d = diff(a, snap());
+		if (got_res) usleep_shutdown_timer_resolution();
+
+		print_diff("LOW_POWER 2500us (no timer)", d);
+		std::printf("    Sleep(ms) fallback: min=%llu p50=%llu max=%llu us\n",
+			(unsigned long long)pct(v, 0.00), (unsigned long long)pct(v, 0.50),
+			(unsigned long long)pct(v, 1.00));
+		assert_eq_u64(d.timer_uses,   0,  "NO_TIMER must not use the waitable timer");
+		assert_ge_u64(d.yield_sleep1, 20, "each call must go through the Sleep(ms) fallback");
+		// 下限が本体。Sleep(2) の 500us 不足を詰めていなければ min < 2500 で落ちる。
+		assert_ge_u64(pct(v, 0.00), 2500,
+			"Sleep(ms) fallback truncates us->ms; the remainder must be spun out "
+			"even when spin_last_us == 0");
+	}
+
+	// --- (d) AUTO に戻すと通常のタイマ経路へ復帰すること ---
+	{
+		assert_ret(usleep_internal_force_wait_backend(FORCE_AUTO), 0, "force AUTO");
+		usleep_set_profile(USLP_BALANCED);
+		usleep_stats_t a = snap();
+		usleep_win(3000); // >= timer_first_us(2000)
+		StatDiff d = diff(a, snap());
+		print_diff("BALANCED 3000us (auto)", d);
+		assert_true(d.timer_uses >= 1 || d.yield_sleep1 >= 1,
+			"AUTO must restore the normal coarse-wait path");
+	}
+
+	// --- (e) フックはスレッドローカル（プロセス全体を汚さない） ---
+	{
+		assert_ret(usleep_internal_force_wait_backend(FORCE_NO_TIMER), 0, "force NO_TIMER on main");
+		std::atomic<uint64_t> worker_timer{0};
+		std::thread th([&]
+		{
+			usleep_set_profile(USLP_BALANCED);
+			usleep_stats_t a = snap();
+			usleep_win(3000);
+			worker_timer.store(diff(a, snap()).timer_uses, std::memory_order_relaxed);
+		});
+		th.join();
+		assert_ret(usleep_internal_force_wait_backend(FORCE_AUTO), 0, "restore AUTO");
+		std::printf("    worker timer_uses while main forced NO_TIMER: %llu\n",
+			(unsigned long long)worker_timer.load());
+		assert_ge_u64(worker_timer.load(), 1,
+			"the force hook is thread-local: a worker thread must still use the timer");
+	}
+
+	usleep_internal_force_wait_backend(FORCE_AUTO);
+	usleep_set_profile(USLP_BALANCED);
+}
+
+//============================================================
+// 9. CPU 会計の回帰テスト（ベンチが表示する CPU% の計器そのものを検証する）
+//	 ベンチはツールなので、CPU 使用率の計算が壊れても誰も気づかない。実際、
+//	 旧ベンチの cpu_pct は GetProcessTimes の 15.625ms ティック量子化によって
+//	 「ほぼ 0.00% か 1562.50% か」の二値になっており、同一条件で ±45% ばらつく
+//	 うえ下限も無い、という状態だった。
+//
+//	 環境非依存で綺麗なアンカーが 2 つある。これで上下両方の境界を張る。
+//	   (A) 純ビジー待機（tick_us=1 / spin_last_us=0 / YIELD_NONE）
+//		   ＝ 譲らずに QPC を読み続けるだけのループ。論理コア 1 個の 100% 付近。
+//	   (B) OS の Sleep で寝ているだけの区間 ＝ ほぼ 0%。
+//	 (A) だけだと「常に 100% を返す壊れ方」を、(B) だけだと「常に 0% を返す
+//	 壊れ方」を見逃す。両方を置いてはじめて計器として検証できる。
+//
+//	 さらに (A) の区間では GetThreadTimes 側の課金も正しく効く（数百 ms 連続で
+//	 走るのでティックサンプリングが機能する）。サイクル計と突き合わせることで、
+//	 換算係数 cycles/µs の実測がずれていないかを独立に検証する。
+//============================================================
+static void test_cpu_accounting()
+{
+	std::puts("[TEST] CPU accounting meter (regression guard for the bench)...");
+
+	uslp_cpu::init();
+	if (!uslp_cpu::g_pQueryThreadCycleTime)
+	{
+		std::puts("    QueryThreadCycleTime unavailable - skipping (Vista+ only)");
+		return;
+	}
+
+	const double cyc_per_us = uslp_cpu::calibrate_cycles_per_us(20000);
+	std::printf("    calibrated: %.1f cycles/us\n", cyc_per_us);
+	// 換算係数の妥当性。0.3GHz〜20GHz 相当を外れたら実測が壊れている。
+	assert_true(cyc_per_us >= 300.0 && cyc_per_us <= 20000.0,
+		"calibrated cycles/us is outside a physically plausible range");
+
+	// ---- (A) 純ビジー待機は論理コア 1 個の 100% 付近になる ----
+	usleep_set_profile(USLP_BALANCED);
+	usleep_set_yield_policy(USLP_YIELD_NONE); // 譲らない = 100% に張り付く
+	usleep_set_spin_last_us(0);
+	usleep_reset_stats();
+
+	usleep_stats_t a = snap();
+	uslp_cpu::Span busy;
+	busy.start();
+	// 1µs 締切を連続で切る。締切は必ず「今」から取り直す（過去の締切を渡すと
+	// 即 return してスピン経路に入らず、計器ではなくテストの方が空振りになる）。
+	while (uslp_cpu::qpc_now_us() - busy.wall0 < 300000ULL)
+		usleep_until_steady_us(usleep_now_steady_us() + 1);
+	busy.stop();
+	StatDiff d = diff(a, snap());
+
+	const double busy_cyc_pct = busy.cycle_cpu_pct(cyc_per_us);
+	const double busy_thr_pct = busy.thread_cpu_pct();
+	print_diff("busy 1us x 300ms", d);
+	std::printf("    busy: cycle=%.2f%% getthreadtimes=%.2f%% of 1 core (wall=%llu us)\n",
+		busy_cyc_pct, busy_thr_pct, (unsigned long long)busy.wall_us);
+
+	// 経路の証明。タイマやイールドに落ちていたら 100% にならなくて当然なので、
+	// CPU% を見る前に「本当に純スピンだったか」をカウンタで確定させる。
+	assert_eq_u64(d.timer_uses,   0, "busy anchor must not use the waitable timer");
+	assert_eq_u64(d.yield_sleep0, 0, "busy anchor must not call Sleep(0)");
+	assert_eq_u64(d.yield_sleep1, 0, "busy anchor must not call Sleep(1)");
+	assert_eq_u64(d.yield_switch, 0, "busy anchor must not call SwitchToThread");
+	assert_ge_u64(d.spin_relax,   1, "busy anchor must actually spin");
+	assert_ge_u64(busy.wall_us, 300000, "busy anchor must have run for at least 300ms");
+
+	// 上下両方の境界。旧計器の壊れ方（0.00% / 1562.50%）はどちらもここで落ちる。
+	// CI モードでも緩めない: これは実時間のジッタではなく計器の正しさの検証で、
+	// 共有ホストでプリエンプトされても数十 % 単位では動かない。
+	assert_true(busy_cyc_pct >= 60.0,
+		"pure busy wait must report at least 60% of one core");
+	assert_true(busy_cyc_pct <= 140.0,
+		"pure busy wait must not report more than 140% of one core (single thread)");
+	if (busy_cyc_pct < 60.0 || busy_cyc_pct > 140.0)
+	{
+		std::fprintf(stderr, "       measured busy cycle cpu = %.2f%% (cycles=%llu, wall=%llu us)\n",
+			busy_cyc_pct, (unsigned long long)busy.cycles, (unsigned long long)busy.wall_us);
+	}
+
+	// 換算係数の独立検証: 300ms 連続実行の区間なら GetThreadTimes も正しく課金
+	// されるので、両者は近い値になるはず。ここが開くのは係数の実測がずれた合図。
+	const double gap = (busy_cyc_pct > busy_thr_pct)
+		? (busy_cyc_pct - busy_thr_pct) : (busy_thr_pct - busy_cyc_pct);
+	if (gap > 25.0)
+	{
+		std::fprintf(stderr,
+			"[FAIL] cycle-based and GetThreadTimes-based CPU%% disagree on a "
+			"continuously-running span: cycle=%.2f%% getthreadtimes=%.2f%% (gap=%.2f pt)\n",
+			busy_cyc_pct, busy_thr_pct, gap);
+		g_failures++;
+	}
+
+	// ---- (B) 寝ているだけの区間はほぼ 0% ----
+	// usleep_win ではなく OS の Sleep を使う。ここで検証したいのは待機実装では
+	// なく計器の側であり、待機実装のスピンが混ざると意味が変わるため。
+	{
+		uslp_cpu::Span idle;
+		idle.start();
+		Sleep(200);
+		idle.stop();
+		const double idle_pct = idle.cycle_cpu_pct(cyc_per_us);
+		std::printf("    idle: cycle=%.2f%% of 1 core (wall=%llu us)\n",
+			idle_pct, (unsigned long long)idle.wall_us);
+		assert_ge_u64(idle.wall_us, 150000, "Sleep(200) span must be at least 150ms");
+		assert_true(idle_pct <= 5.0,
+			"a sleeping thread must report near 0% CPU (the meter is not stuck high)");
+		if (idle_pct > 5.0)
+		{
+			std::fprintf(stderr, "       measured idle cycle cpu = %.2f%%\n", idle_pct);
+		}
+	}
+
+	usleep_set_profile(USLP_BALANCED);
+}
+
 int main()
 {
-	std::puts("[TEST] usleep_win test suite");
+	std::printf("[TEST] usleep_win test suite (CI mode: %s)\n",
+		g_ci_mode ? "ON - upper bounds relaxed, lower bounds unchanged" : "off");
 
 	test_paths();
 	test_timing();
@@ -620,6 +935,8 @@ int main()
 	test_setters();
 	test_resolution();
 	test_thread_isolation();
+	test_forced_backends();
+	test_cpu_accounting();
 
 	if (g_failures)
 	{

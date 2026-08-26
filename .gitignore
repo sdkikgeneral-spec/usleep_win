@@ -20,3 +20,11 @@ bench_*.exe
 
 # Claude Code のローカル個人設定
 .claude/settings.local.json
+
+# ---- エディタのマシン依存設定 ----
+# .vscode/settings.json のみ追跡する（ポータブルな内容に保つこと）。
+# c_cpp_properties.json は cpptools がコンパイラの絶対パスを書き込むので追跡しない。
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json

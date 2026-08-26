@@ -2,7 +2,7 @@
 
 本ドキュメントは `usleep_win` ライブラリの内部設計・API 仕様・チューニングガイドをまとめた技術仕様書です。
 
-対象バージョン: **v0.2.1**（`meson.build` の `version:` / `resource/usleep_win.rc` の FILEVERSION / `USLEEP_WIN_VERSION_STRING` と一致）
+対象バージョン: **v0.2.2**（`meson.build` の `version:` / `resource/usleep_win.rc` の FILEVERSION / `USLEEP_WIN_VERSION_STRING` と一致）
 
 ---
 
@@ -101,7 +101,12 @@ if (usec >= timer_first_us || (can_hr && usec > prefer_spin_below))
 
 3. **フォールバック** (タイマーの取得/セットに失敗した場合)
    - `usec >= 1000` なら `Sleep(usec / 1000)` + 純スピンで締切まで詰める
+   - `Sleep(ms)` は µs→ms の切り捨て分（最大 999µs）だけ短く眠るため、**プロファイルや
+     `spin_last_us` の値に関わらず** `spin_with_yield_until_us(target, 0, USLP_YIELD_NONE)`
+     で締切まで詰める（v0.2.2 の修正。下記参照）
    - `usec < 1000` の場合はスピン経路（4. と同じ）へフォールスルー
+   - この経路に到達するのは高分解能 WaitableTimer を作れない環境
+     （Windows 10 1803 未満・WINE など）に限られる
 
 4. **スピン経路**（タイマー条件を満たさない場合）
    - `LOW_POWER` は `spin_with_yield_until_us(target, 0, USLP_YIELD_SLEEP1)`
@@ -119,6 +124,32 @@ spin_with_yield_until_us():
   それ以外:
     cpu_relax() × 3  … YieldProcessor 3回
 ```
+
+### `yield_policy` が参照される条件（重要）
+
+`yield_policy` は `spin_with_yield_until_us()` の第 3 引数として渡された場合にだけ意味を持つ。
+`do_sleep_us()` が `t_cfg.yield_policy` を渡すのは **最後のスピン経路 1 箇所だけ**であり、
+それ以外の呼び出しはすべてリテラルのポリシーで固定されている。
+
+| 呼び出し箇所 | 渡すポリシー | `yield_policy` |
+|---|---|---|
+| タイマー復帰後の末尾スピン | `USLP_YIELD_NONE`（固定） | **参照しない** |
+| `Sleep(ms)` フォールバック後の詰めスピン | `USLP_YIELD_NONE`（固定） | **参照しない** |
+| `LOW_POWER` のスピン経路 | `USLP_YIELD_SLEEP1`（固定） | **参照しない** |
+| それ以外のスピン経路 | `t_cfg.yield_policy` | **参照する** |
+
+したがって `usleep_set_yield_policy()` が振る舞いを変えるのは、**待機がタイマー経路に
+入らなかったときだけ**である。経路選択の式は
+`usec >= timer_first_us || (can_hr && usec > prefer_spin_below)` であり、
+**`spin_last_us` は経路選択に一切関与しない**（タイマー経路内での
+`coarse_us = usec - spin_last_us` の計算にだけ使われる）。
+
+BALANCED（`prefer_spin_below = 200`）で HR タイマーが使える現代の Windows では、
+200µs を超える待機はすべてタイマー経路に入るため、**1ms 周期のメインループでは
+`yield_policy` を変えても何も変わらない**。v0.2.2 の実測（2026-08-26）でも、
+1ms 周期・BALANCED・`spin_last_us=200` の全 40 ランで `timer_used` がほぼ全反復を占め、
+`yield_switch` / `yield_sleep0` / `yield_sleep1` はいずれも 0 だった
+（[test_result.md](./test_result.md) グループA）。
 
 ---
 
@@ -151,8 +182,8 @@ USLEEP_API <戻り値> USLEEP_CALL <関数名>(...);
 |---|---|---|---|
 | `USLEEP_WIN_VERSION_MAJOR` | マクロ | `0` | メジャー |
 | `USLEEP_WIN_VERSION_MINOR` | マクロ | `2` | マイナー |
-| `USLEEP_WIN_VERSION_PATCH` | マクロ | `1` | パッチ |
-| `USLEEP_WIN_VERSION_STRING` | マクロ | `"0.2.1"` | 文字列表現 |
+| `USLEEP_WIN_VERSION_PATCH` | マクロ | `2` | パッチ |
+| `USLEEP_WIN_VERSION_STRING` | マクロ | `"0.2.2"` | 文字列表現 |
 | `USLEEP_WIN_VERSION_NUM` | マクロ | `major<<16 \| minor<<8 \| patch` | 比較用のパック値 |
 | `usleep_win_version` | 関数 | `uint32_t usleep_win_version(void)` | ロード中の DLL のパック値 |
 | `usleep_win_version_string` | 関数 | `const char* usleep_win_version_string(void)` | ロード中の DLL のバージョン文字列 |
@@ -184,14 +215,43 @@ USLEEP_API <戻り値> USLEEP_CALL <関数名>(...);
 
 | 関数 | シグネチャ | 説明 |
 |---|---|---|
-| `usleep_set_profile` | `int usleep_set_profile(int profile)` | プロファイルを設定（`USLP_BALANCED` / `USLP_STRICT` / `USLP_LOW_POWER`）。成功時 0 |
-| `usleep_set_spin_last_us` | `int usleep_set_spin_last_us(unsigned int us)` | テールスピン長を µs で設定 |
-| `usleep_set_yield_policy` | `int usleep_set_yield_policy(int policy)` | イールド方針を設定 |
+| `usleep_set_profile` | `int usleep_set_profile(int profile)` | プロファイルを設定（`USLP_BALANCED` / `USLP_STRICT` / `USLP_LOW_POWER`）。成功時 0、範囲外は -1 |
+| `usleep_set_spin_last_us` | `int usleep_set_spin_last_us(unsigned int us)` | テールスピン長を µs で設定。成功時 0、`us > USLEEP_SPIN_LAST_US_MAX` のときは **-1 を返し設定を変更しない** |
+| `usleep_set_yield_policy` | `int usleep_set_yield_policy(int policy)` | イールド方針を設定。成功時 0、範囲外は -1 |
 | `usleep_set_power_mode` | `int usleep_set_power_mode(int mode)` | スレッド電力モードを設定（`SetThreadInformation` 使用）。成功時 0、失敗時 -1 |
+
+#### `USLEEP_SPIN_LAST_US_MAX`
+
+```c
+#define USLEEP_SPIN_LAST_US_MAX 10000u   // 10ms
+```
+
+`usleep_set_spin_last_us()` が受け付ける上限。超過時は **-1 を返し、スレッドローカルの
+`spin_last_us` は変更しない**（v0.2.2 で追加。それ以前は常に 0 を返して任意の値を受け付けていた）。
+
+上限の根拠:
+
+- 末尾スピンは `YieldProcessor()` で 1 コアを 100% 占有する区間。上限が無いと
+  `usleep_set_spin_last_us(UINT_MAX)` であらゆる待機が純ビジースピンに化け、
+  待機 API としての契約が壊れる
+- Windows 既定のタイマ分解能は約 15.6ms。これを超える末尾スピンは
+  「タイマの粗さをスピンで隠す」という設計目的を超え、粗い待機部分が消えて全体がスピンになるだけ
+- 一方 Windows の既定クォンタム（クライアントで約 20〜30ms）を超えてスピンし続けると
+  プリエンプトされ、かえって精度が落ちる
+
+この 2 つの下側にあたる 10ms を上限とした。既定値 250 と各プロファイルが設定する
+0 / 250 / 400 はすべて範囲内なので、正常系の挙動は変わらない。実用上の推奨は 250〜500µs。
 
 > **呼び出し順序に注意**: `usleep_set_profile()` は `spin_last_us` と `yield_policy` を
 > **上書きする**。個別に詰めたい場合は必ず `set_profile()` → `set_spin_last_us()` /
 > `set_yield_policy()` の順で呼ぶこと。逆順では設定が消える。
+
+> **v0.2.2 での修正**: 高分解能 WaitableTimer を作れない環境でのみ到達する
+> `Sleep(ms)` フォールバックにおいて、切り捨て分を詰める処理が `if (spin_last_us > 0)` の
+> 条件下にあったため、`spin_last_us == 0` となる `LOW_POWER` では
+> **µs→ms の切り捨て分（最大 999µs）を詰めずに return していた**
+> （要求 2500µs に対し実測 2013µs で復帰する契約違反）。プロファイルに関わらず
+> 締切まで詰めるよう修正済み。
 
 > **v0.2.1 での修正**: 古い SDK 向けフォールバックで `THREAD_INFORMATION_CLASS` の
 > `ThreadPowerThrottling` を誤って `11` と定義していたため、`SetThreadInformation` が
@@ -199,6 +259,27 @@ USLEEP_API <戻り値> USLEEP_CALL <関数名>(...);
 > 電力モードは一度も適用されていなかった**。正しい列挙値 `3` に修正済み。
 > なお `SetThreadInformation` 自体が解決できない古い Windows では、
 > 従来どおり設定値をスレッドローカルに記録して 0 を返す（実際の絞りは行われない）。
+
+### 内部テストフック（**公開 API ではない**）
+
+`usleep_internal_force_wait_backend(int mode)` を実装ファイル内に持っているが、これは
+**公開ヘッダ `include/usleep_win.h` には宣言されておらず、ABI 互換性も保証しない**。
+利用者コードから依存してはならない（予告なく変更・削除しうる）。
+
+存在理由は、通常の実行環境では到達不能な次の 2 経路をテストから踏むため。
+
+- `LOW_POWER` の純スピン分岐（`prefer_spin_below == 0` なので HR タイマーが使える環境では
+  すべてタイマー経路に吸われる）
+- `SetWaitableTimer` 失敗時の `Sleep(ms)` フォールバック
+
+| `mode` | 挙動 |
+|---:|---|
+| 0 | 実環境の判定に従う（既定） |
+| 1 | HR タイマー非対応環境として振る舞う（経路選択のみに影響） |
+| 2 | WaitableTimer 自体が使えない環境として振る舞う |
+
+スコープは**スレッドローカル**（`t_force_backend`）。プロセス全体の `g_has_hrtimer` を
+書き換えると他スレッドの挙動まで変わり、状態スコープの規約に反するため。
 
 ### 統計 API
 
@@ -244,8 +325,9 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 - `timer_first_us`: この値以上の待機で WaitableTimer を使用
 - `prefer_spin_below`: High-Resolution Timer が利用可能な場合に、この値を超えたらタイマー経路に入る
   （`LOW_POWER` は 0 なので、HR タイマーが使える環境では 1µs 以上の待機がすべてタイマー経路になる）
-- `spin_last_us`: WaitableTimer 後のテールスピン長
-- `yield_policy`: 64 イテレーション毎のリラックス方式
+- `spin_last_us`: WaitableTimer 後のテールスピン長。**経路選択には関与しない**
+- `yield_policy`: 64 イテレーション毎のリラックス方式。
+  **スピン経路でしか参照されない**（上記「`yield_policy` が参照される条件」参照）
 
 ### `usleep_set_profile()` の副作用
 
@@ -279,8 +361,53 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 - 用途: バックグラウンド処理、省電力サーバー
 
 ### スピン/イールド微調整のコツ
-- `usleep_set_spin_last_us(200〜400)` : 長く→ジッタ↓/CPU↑、短く→CPU↓/ジッタ↑
-- `usleep_set_yield_policy(...)` : `SLEEP0`（既定）、`SWITCH_THREAD`（局所性）、`SLEEP1`（省電力）
+- `usleep_set_spin_last_us(200〜400)` : 長く→ジッタ↓/CPU↑、短く→CPU↓/ジッタ↑。
+  ただし**待機長以上にしないこと**（`usec > spin_last_us` が偽になると `coarse_us = usec` に落ち、
+  末尾スピンの余白が取れずタイマー起床の遅れがそのまま遅着になる）
+- `usleep_set_yield_policy(...)` : `SLEEP0`（既定）、`SWITCH_THREAD`（局所性）、`SLEEP1`（省電力）。
+  **スピン経路に入る待機にしか効かない**
+
+### 実測にもとづくチューニング指針
+
+以下は v0.2.2 / 2026-08-26 の再測定にもとづく。数値の出典と全表は
+[test_result.md](./test_result.md) を参照。
+
+測定条件: Intel Core Ultra 9 285K（論理 24 コア）/ Windows 11 Home 10.0.26200 /
+電源プラン「バランス」/ MSVC 19.51 release / `usleep_until_steady_us()` による締切方式・2000 反復 /
+プロファイル BALANCED / クリーンではない背景負荷（システム全体 CPU 4〜6%）。
+CPU% は **論理コア 1 個 = 100%**（`QueryThreadCycleTime` 由来、測定スレッド自身のみ）。表はレンジ。
+
+**締切精度に効くのはタイマー分解能ではなく `spin_last_us`**（1ms 周期 / 分解能 1ms / n=3）
+
+| `spin_last_us` | p50 遅着 (µs) | p95 遅着 (µs) | CPU% (1 コア = 100) |
+|---:|---:|---:|---:|
+| 200 | 90–131 | 361–419 | 2.87–3.28 |
+| 400 | 0 | 119–146 | 12.95–13.71 |
+| 600 | 0 | 0 | 44.51–44.69 |
+
+**タイマー分解能 0.5ms はこの構成では 1ms より良くならない**
+
+- 1ms 周期・`spin_last_us=200`（n=5）では、`usleep_init_nt_resolution(5000)` で 0.5ms にしても
+  p50 遅着は 71–130µs → 132–149µs と**悪化**し、CPU% は 2.63–3.72% → 2.28–2.90% と微減した。
+  **機序は本測定では特定できていない**。本実装が使うのは
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` で、グローバルなタイマー分解能設定とは独立に
+  動作する系統であるという事実は関係しうるが、因果を断定してはならない。
+- 分解能が 1 桁効くのは **`Sleep(1)` を踏む構成だけ**である。200µs 周期・`spin_last_us=0`・
+  `USLP_YIELD_SLEEP1`（スピン経路）では p50 遅着が 1ms 分解能で 7808–7906µs、
+  0.5ms 分解能で 710–753µs だった。
+- タイマー分解能はシステム全体の共有状態なので、**ライブラリ側で勝手に握らない**
+  現行の既定（`init` を呼ばない限り触らない）を維持する。
+
+**イールド方針は CPU を下げる手段ではない**
+
+- 200µs 周期・`spin_last_us=0`（スピン経路）では `NONE` / `SWITCH_THREAD` / `SLEEP0` は
+  p50 / p95 遅着 = 0µs を達成するが、CPU% は 99.34–100.44%（≈ 論理コア 1 個丸ごと）。
+  `Sleep(0)` は他スレッドに実行機会を与えるだけで、自スレッドは走り続けるため。
+- CPU を手放すのは `SLEEP1` のみ（1ms 分解能 0.18–0.27% / 0.5ms 分解能 0.71–0.82%）だが、`Sleep(1)` の実待機が
+  そのまま遅延になるため短い周期には追従できない。
+
+> いずれも **1 台・1 条件でのスナップショット**であり、Windows はハードリアルタイム OS では
+> ない以上、別のマシン・電源プラン・負荷では傾向ごと変わりうる。
 
 ---
 
@@ -331,6 +458,7 @@ enum UsleepYieldPolicy{ USLP_YIELD_NONE=0, USLP_YIELD_SWITCH_THREAD=1, USLP_YIEL
 |---|---|---|
 | `t_timer` | `HANDLE` | WaitableTimer ハンドル（スレッド毎に作成） |
 | `t_cfg` | `UsleepConfig` | プロファイル・スピン長・イールド方針・電力モード |
+| `t_force_backend` | `int` | 内部テストフックによる待機バックエンドの強制（既定 0 = 自動） |
 | `t_stat_spin_relax` | `uint64_t` | PAUSE/YIELD カウンタ |
 | `t_stat_yield_switch` | `uint64_t` | SwitchToThread カウンタ |
 | `t_stat_yield_sleep0` | `uint64_t` | Sleep(0) カウンタ |
@@ -376,6 +504,22 @@ DllMain（ローダロック保持中）から到達しうる経路で CRT の o
 > ただし `DLL_PROCESS_DETACH` は保険であり、通常は明示的に `usleep_shutdown_timer_resolution()` /
 > `usleep_shutdown_nt_resolution()` を呼ぶこと。`init` したら必ず対応する `shutdown` を呼ぶのが原則。
 
+### 静的リンク時は `DllMain` が呼ばれない
+
+`libusleep_win_static.a` にリンクした場合（`USLEEPWIN_STATIC` 定義時）、実装は EXE の一部に
+なるため **`DllMain` は一度も呼ばれない**。したがって上記の保険はいずれも働かない。
+
+| 後始末 | DLL リンク | 静的リンク |
+|---|---|---|
+| スレッド終了時の `t_timer` クローズ | `DLL_THREAD_DETACH` で自動 | **走らない**（プロセス終了で OS がハンドルを回収する） |
+| `timeEndPeriod` によるタイマー分解能の復帰 | `DLL_PROCESS_DETACH` で自動 | **走らない**（明示的な `shutdown` が必須） |
+| `NtSetTimerResolution` による分解能の復帰 | `DLL_PROCESS_DETACH` で自動 | **走らない**（明示的な `shutdown` が必須） |
+
+`t_timer` は OS がプロセス終了時にハンドルを回収するので実害は小さいが、タイマー分解能は
+**システム全体の設定**であり、戻し忘れるとプロセス終了後も上がったまま残る。
+静的リンクの利用者は `usleep_init_timer_resolution()` / `usleep_init_nt_resolution()` を
+呼んだら、終了前に必ず対応する `shutdown` を呼ぶこと。
+
 ---
 
 ## ビルドと利用形態
@@ -390,15 +534,91 @@ DllMain（ローダロック保持中）から到達しうる経路で CRT の o
 
 DLL 本体のビルドでは `USLEEPWIN_EXPORTS` を定義する（Meson / Makefile とも `-DUSLEEPWIN_EXPORTS` を付与済み）。
 
+### ビルドターゲット
+
+| ターゲット | Meson | Makefile |
+|---|---|---|
+| 共有ライブラリ | `shared_library('usleep_win', name_prefix: '')` → `usleep_win.dll` | `usleep_win.dll` |
+| 静的ライブラリ | `static_library('usleep_win_static')` → `libusleep_win_static.a` | `libusleep_win_static.a` |
+| テスト（共有） | `test_usleep` | `test_usleep.exe` |
+| テスト（静的） | `test_usleep_static`（`-DUSLEEPWIN_STATIC` 付きで静的ライブラリに直接リンク） | `test_usleep_static.exe` |
+| CSV ベンチ | `bench_usleep_csv`（`install: false`） | `bench_usleep_csv.exe` |
+
+`tools/cpu_accounting.h` はどちらのビルドシステムにも登録しない純粋なヘッダで、
+`tools/bench_usleep_csv.cpp` と `tests/test_usleep.cpp` の両方から include される。
+「ベンチが表示する CPU% と、テストが検証する CPU% が同じ計器であること」を
+コンパイル時に保証するためであり、テストの `test_cpu_accounting()` が
+「純ビジー待機 = 論理コア 1 個の 100% 付近」「寝ているだけのスレッド = 0%」を
+回帰テストする。計器が壊れたらベンチではなくテストが落ちる。
+
+- `name_prefix: ''` により、MinGW でも DLL 名が `libusleep_win.dll` ではなく `usleep_win.dll` になる。
+  MSVC(Meson) / MinGW(Meson) / MinGW(Makefile) の 3 系統で DLL 名が揃う。
+- 静的ライブラリのターゲット名を `usleep_win_static` と分けているのは、MSVC で
+  `shared_library('usleep_win')` のインポートライブラリ `usleep_win.lib` と名前が衝突するため。
+- 静的ライブラリにはバージョンリソース（`.rc`）を含めない。FILEVERSION はモジュール
+  （DLL / EXE）単位の情報であり、`.lib` / `.a` に埋めても意味がないため。
+- **静的版テスト `test_usleep_static` はビルドのたびに実行される。** ヘッダのマクロ分岐だけでは
+  「`USLEEPWIN_STATIC` が実機でリンク・実行まで通る」保証にならないため、経路そのものを毎回検証する。
+- `-Dnative=true` では MSVC 側に `/GL` が付く。`/GL` 付きオブジェクトを含む静的ライブラリを
+  利用者が `/LTCG` 無しでリンクすると警告になる。既定（`native=false`）では `/GL` を付けない。
+
+### インストールされる配布物
+
+```bash
+meson install -C build --destdir stage        # Meson
+mingw32-make install PREFIX=/mingw64          # Makefile（MinGW）
+```
+
+| パス | 内容 |
+|---|---|
+| `bin/usleep_win.dll` | 共有ライブラリ |
+| `lib/usleep_win.lib` | インポートライブラリ（MSVC）。MinGW + Meson は `usleep_win.dll.a`、MinGW + Makefile は `libusleep_win.a` |
+| `lib/libusleep_win_static.a` | 静的ライブラリ（Meson は MSVC でもこの名前で出力する） |
+| `include/usleep_win.h` | 公開ヘッダ |
+| `lib/pkgconfig/usleep_win.pc` | pkg-config（共有版）。`Libs: -lusleep_win` / `Libs.private: -lwinmm` |
+| `lib/pkgconfig/usleep_win-static.pc` | pkg-config（静的版）。`Cflags` に `-DUSLEEPWIN_STATIC` を含む |
+
+Meson をサブプロジェクトとして取り込む場合は、`usleep_win` / `usleep_win-static` の 2 つの
+依存が `meson.override_dependency()` で登録済み（静的側は `-DUSLEEPWIN_STATIC` を
+`compile_args` として自動で伝播する）。
+
+### CI
+
+`.github/workflows/ci.yml` で 5 ジョブを実行する。いずれも警告をエラー扱い
+（Meson は `-Dwerror=true`、Makefile は `-Werror`）にしている。
+
+| ジョブ | 内容 |
+|---|---|
+| MSVC / Meson（`native=false` / `true`） | ビルド → テスト → `meson install` → レイアウト確認 |
+| MinGW / Meson（`native=false` / `true`） | 上記 + `pkgconf` で `.pc` を実際に問い合わせ、静的版の `-DUSLEEPWIN_STATIC` を検証 |
+| MinGW / Makefile | ビルド → テスト（共有 + 静的） → `install` → Meson と成果物名を突き合わせ |
+
+CI のジョブは環境変数 **`USLEEP_TEST_CI=1`** を付けてテストを実行する
+（`tests/test_usleep.cpp` の `detect_ci_mode()`）。共有・仮想化されたホストでは
+スケジューリング遅延が跳ね、実装の劣化と無関係にフレークするためである。
+このモードが緩めるのは **上限側のアサートだけ**で、
+
+- 下限側（要求待機時間を満たしているか＝早期 return の検出）は緩めない
+- 統計カウンタによる経路の証明（等値・下限）も緩めない
+- 環境変数なし（既定）では本番の精度要件のまま走る
+
+呼び出し側は `hi_us(strict_us, ci_us)` で厳密値と CI 値の両方を明示する。
+CI 用の緩い値がいつのまにか本番の閾値として居座るのを防ぐため。
+
 ### 利用形態
 
 | 形態 | 利用者側で定義するマクロ |
 |---|---|
 | DLL をインポートライブラリ経由で使う | なし（既定で `dllimport`） |
-| `src/usleep_ex.cpp` を自プロジェクトに取り込む／静的にリンクする | `USLEEPWIN_STATIC` |
+| 静的ライブラリ（`libusleep_win_static.a`）にリンクする／`src/usleep_ex.cpp` を自プロジェクトに取り込む | `USLEEPWIN_STATIC` |
 
 `USLEEPWIN_STATIC` を定義すると `USLEEP_API` が空になり、`__declspec(dllimport)` が付かなくなる。
 定義し忘れると、リンカが `__imp_` 付きシンボルを探して未解決になる。
+pkg-config 経由なら `usleep_win-static.pc` の `Cflags` に含まれるので定義漏れは起きない。
+
+> **静的リンクでは `DllMain` が呼ばれない。** タイマー分解能の自動復帰と `t_timer` の
+> 自動クローズが働かないため、利用者が `usleep_shutdown_*` を明示的に呼ぶ必要がある。
+> 詳細は [DllMain クリーンアップ](#dllmain-クリーンアップ) を参照。
 
 ### ソースの文字コード
 

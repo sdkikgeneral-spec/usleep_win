@@ -142,6 +142,30 @@ static inline void cpu_relax()
 
 static thread_local HANDLE t_timer = NULL;
 
+// ---- 待機バックエンドの強制（テスト専用の内部フック） ----
+// 公開ヘッダ include/usleep_win.h には載せない。公開 ABI ではないので予告なく
+// 変更・削除しうる（利用者向け API ではない）。
+//
+// 理由: HR WaitableTimer が使える通常の Windows 10 1803+ 環境では、
+// do_sleep_us() の以下 2 経路が到達不能になり、テストで検証できない。
+//   (a) LOW_POWER の純スピン分岐 … LOW_POWER は prefer_spin_below==0 なので
+//       can_hr が真だと usec>0 の全てがタイマ経路へ吸われる
+//   (b) SetWaitableTimer 失敗時の Sleep(ms) フォールバック … タイマ生成も
+//       SetWaitableTimer も通常は成功する
+// 「検証できないコードを黙って残す」のを避けるため、削除ではなく注入で
+// 両経路をテストから踏めるようにする（HR タイマの無い古い Windows / WINE 等では
+// 実際に到達しうる経路なので、削除は機能後退になる）。
+//
+// スコープはスレッドローカル。プロセス全体の g_has_hrtimer を書き換えると
+// 他スレッドの挙動まで変わってしまい、状態スコープの規約に反する。
+enum UsleepForceBackend
+{
+	USLP_FORCE_AUTO 	  = 0, // 実環境の判定に従う（既定）
+	USLP_FORCE_NO_HRTIMER = 1, // HR タイマ非対応環境として振る舞う（経路選択のみ影響）
+	USLP_FORCE_NO_TIMER   = 2, // WaitableTimer 自体が使えない環境として振る舞う
+};
+static thread_local int t_force_backend = USLP_FORCE_AUTO;
+
 struct UsleepConfig
 {
 	UsleepProfile	  profile	   = USLP_BALANCED;
@@ -315,11 +339,13 @@ static void do_sleep_us(uint64_t usec)
 	const uint64_t now_us = qpc_now_us();
 	const uint64_t target_us = (usec > (UINT64_MAX - now_us)) ? UINT64_MAX : (now_us + usec);
 	// HR タイマ可用性はプロセス単位で確定済み（未確定ならここで確定させる）。
-	const bool can_hr = probe_hrtimer_support();
+	// テストフックで「HR なし」を強制されている場合はそちらを優先する。
+	const int force = t_force_backend;
+	const bool can_hr = (force == USLP_FORCE_AUTO) && probe_hrtimer_support();
 
 	if (usec >= timer_first_us || (can_hr && usec > prefer_spin_below))
 	{
-		HANDLE h = get_timer_handle();
+		HANDLE h = (force == USLP_FORCE_NO_TIMER) ? NULL : get_timer_handle();
 		if (h)
 		{
 			uint64_t coarse_us = usec;
@@ -344,14 +370,22 @@ static void do_sleep_us(uint64_t usec)
 			DWORD ms = (DWORD)ms64;
 			t_stat_yield_sleep1++;
 			Sleep(ms);
-			if (spin_last_us > 0)
-			{
-				spin_with_yield_until_us(target_us, 0, USLP_YIELD_NONE);
-			}
+			// Sleep(ms) は usec を ms へ切り捨てた値でしか眠らないため、
+			// 最大 999µs 不足しうる。spin_last_us の値に関わらず必ず target まで
+			// 詰める（spin_last_us==0 の LOW_POWER で早期リターンさせないため。
+			// 以前はここが if (spin_last_us > 0) だったので LOW_POWER + タイマ不可の
+			// 組み合わせで最大 999µs 早く返る契約違反があった）。
+			// 詰める残りは定義上 1ms 未満に収まり、Sleep(ms) は実際にはほぼ必ず
+			// オーバーシュートするためこのループは通常 0 回転で抜ける。
+			spin_with_yield_until_us(target_us, 0, USLP_YIELD_NONE);
 			return;
 		}
+		// usec < 1000 でタイマも使えない場合は下のスピン経路へフォールスルーする。
 	}
 
+	// ここから下は「タイマ経路に入らなかった」または「タイマが使えなかった」場合。
+	// HR タイマのある環境では LOW_POWER(prefer_spin_below==0) がタイマ経路に
+	// 吸われるため、この分岐は HR なし環境（またはテストフック）でのみ到達する。
 	if (prof == USLP_LOW_POWER)
 	{
 		spin_with_yield_until_us(target_us, 0, USLP_YIELD_SLEEP1);
@@ -439,6 +473,19 @@ USLEEP_API int USLEEP_CALL usleep_set_profile(int profile)
 
 USLEEP_API int USLEEP_CALL usleep_set_spin_last_us(unsigned int us)
 {
+	// 上限 USLEEP_SPIN_LAST_US_MAX (10ms) の根拠:
+	//  - spin_last_us は「末尾を YieldProcessor で埋める時間」であり、この区間は
+	//    1 コアを 100% 占有する。上限が無いと set_spin_last_us(UINT_MAX) で
+	//    あらゆる待機が純ビジースピンに化け、待機 API としての契約が壊れる。
+	//  - Windows 既定のタイマ分解能は約 15.6ms。これを超える末尾スピンを許しても
+	//    「タイマの粗さをスピンで隠す」という設計目的を超え、粗い待機部分が
+	//    消えて全体がスピンになるだけで意味がない。
+	//  - 一方 Windows の既定クォンタム（クライアントで約 20〜30ms）を超えて
+	//    スピンし続けるとプリエンプトされ、かえって精度が落ちる。
+	//  この 2 つの下側にあたる 10ms を上限とする。実用上の推奨値（250〜500µs）
+	//  に対して十分な余裕があり、既定値・各プロファイルが設定する値
+	//  （0 / 250 / 400）はすべて範囲内なので既存の正常系は挙動が変わらない。
+	if (us > USLEEP_SPIN_LAST_US_MAX) return -1; // 範囲外では設定を変更しない
 	t_cfg.spin_last_us = us;
 	return 0;
 }
@@ -597,6 +644,17 @@ USLEEP_API uint32_t USLEEP_CALL usleep_win_version(void)
 USLEEP_API const char* USLEEP_CALL usleep_win_version_string(void)
 {
 	return USLEEP_WIN_VERSION_STRING;
+}
+
+// ---- テスト専用の内部フック（公開ヘッダ非掲載・ABI 互換の保証なし） ----
+// 到達不能になりがちな待機経路をテストから強制的に踏むためだけに存在する。
+// mode は UsleepForceBackend の値。設定はスレッドローカル。
+// 戻り値は他の setter と同じく 0 = 成功 / -1 = 範囲外。
+USLEEP_API int USLEEP_CALL usleep_internal_force_wait_backend(int mode)
+{
+	if (mode < USLP_FORCE_AUTO || mode > USLP_FORCE_NO_TIMER) return -1;
+	t_force_backend = mode;
+	return 0;
 }
 
 } // extern "C"
